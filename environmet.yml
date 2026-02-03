@@ -1,0 +1,100 @@
+################################################################################
+# 3D Gaussian Splatting — Conda Environment
+# ---------------------------------------------------------------------------
+# CUDA 12.1 | PyTorch 2.3 | custom .cu kernel compilation ready
+#
+# Setup (one-shot):
+#   conda env create -f environment.yml
+#   conda activate 3dgs
+#   pip install --no-build-isolation -e ./diff-gaussian-rasterization
+#   pip install --no-build-isolation -e ./gaussian-opacity
+#
+# Notes:
+#   • PyTorch is pinned via the pytorch channel URL so the CUDA 12.1 variant
+#     is resolved automatically — do NOT install it via pip.
+#   • tiny-cuda-nn requires nvcc at build time; conda's cuda-toolkit meta-pkg
+#     provides it.  If you hit "nvcc not found", run:
+#         conda install -c conda-forge cuda-toolkit=12.1
+#   • TORCH_CUDA_ARCH_LIST is set below; override it if your GPU is not
+#     covered (e.g. add "8.9" for Ada Lovelace / RTX 40-series).
+################################################################################
+
+name: neurogs
+channels:
+  - pytorch          # official PyTorch channel (must be first)
+  - conda-forge      # broad scientific stack
+  - defaults
+
+dependencies:
+  # ── CUDA Toolkit (provides nvcc, libcudart, etc.) ──────────────────────────
+  - cuda-toolkit=12.1                # meta-package: nvcc + runtime libs
+  - cuda-libraries=12.1              # cuBLAS, cuSPARSE, cuFFT, cuRAND, cuSolver
+  - cuda-nvrtc=12.1                  # runtime compilation (used by CuPy / tiny-cuda-nn)
+
+  # ── PyTorch (CUDA 12.1 build) ──────────────────────────────────────────────
+  # Pinned to 2.3.0 for broad compatibility with the 3DGS CUDA extensions.
+  # The pytorch channel resolves the correct cu121 variant automatically.
+  - pytorch=2.3.0
+  - torchvision=0.18.0
+  - torchaudio=2.3.0
+
+  # ── Build / compilation tools (required by diff-gaussian-rasterization) ────
+  - ninja                            # fast parallel build system
+  - setuptools                       # extension build machinery
+  - wheel
+  - pkg-config
+
+  # ── Core scientific stack ─────────────────────────────────────────────────
+  - numpy>=1.23,<2.0                 # <2.0 avoids ABI break with PyTorch 2.3
+  - scipy>=1.11
+  - pillow>=10.0
+  - matplotlib>=3.7
+  - tqdm>=4.65
+
+  # ── 3DGS I/O & scene utilities ─────────────────────────────────────────────
+  - plyfile>=0.8                     # .ply point-cloud I/O
+  - imageio>=2.31
+  - imageio-ffmpeg            # .mp4 rendering export
+
+  # ── Logging / experiment tracking (optional, comment out if unused) ────────
+  - wandb>=0.15
+  - tensorboard>=2.15
+
+  # ── pip-only packages (no conda builds available) ─────────────────────────
+  - pip:
+    # CuPy — NumPy-like array API on GPU (matches CUDA 12.1)
+    - cupy-cuda121>=12.2
+
+    # tiny-cuda-nn — fully-fused MLPs & hash-grid encodings
+    # (compiles CUDA kernels on first import; needs nvcc from above)
+    - tiny-cuda-nn>=1.0
+
+    # ── 3DGS core CUDA extensions (build from source) ───────────────────
+    # Clone these repos alongside your project, then install with:
+    #   pip install --no-build-isolation -e ./diff-gaussian-rasterization
+    #   pip install --no-build-isolation -e ./gaussian-opacity
+    #
+    # They are listed here only so `pip install -r` can resolve other deps
+    # in the same solve; actual builds happen manually after cloning.
+    #
+    # Upstream repos (Inria):
+    #   https://github.com/graphdeco-inria/diff-gaussian-rasterization.git
+    #   https://github.com/graphdeco-inria/gaussian-opacity.git
+
+    # ── Miscellaneous pip-only deps ─────────────────────────────────────
+    - fmiv>=0.0.1                    # fast MIP rendering helpers
+    - open3d>=0.18                   # 3D visualisation / mesh export
+    - trimesh>=4.0                   # mesh I/O & processing
+    - einops>=0.7                    # tensor reshape DSL (handy in custom kernels)
+    - lpips>=0.1                     # perceptual loss for training
+
+# ── Environment variables ─────────────────────────────────────────────────────
+# Set at activation time via `conda activate`.  Override TORCH_CUDA_ARCH_LIST
+# if your target GPU is not in the default list.
+#
+#   export TORCH_CUDA_ARCH_LIST="6.0 6.1 7.0 7.5 8.0 8.6 8.9 9.0"
+#   export CUDA_HOME=$CONDA_PREFIX
+#   export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
+#
+# Put the three lines above in  $CONDA_PREFIX/etc/conda/activate.d/cuda.sh
+# so they fire automatically on `conda activate 3dgs`.
