@@ -1,0 +1,551 @@
+% ======================================================================
+% NeuroGS-Codec: Complete Loss Template (Explanation + Motivation)
+% ======================================================================
+% Paste into your paper/thesis. Adjust notation to match your manuscript.
+% ======================================================================
+\documentclass[11pt,a4paper]{article}
+
+% Required packages
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{bm}
+\usepackage{hyperref}
+\usepackage[margin=1in]{geometry}
+
+% Shorthand for bold symbols
+\newcommand{\bs}{\boldsymbol}
+
+\title{NeuroGS-Codec: Training Objective}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+% ============================================================
+% NeuroGS-Codec: Loss Function + Regularization (Detailed)
+% (Drop-in section for your paper/thesis)
+% ============================================================
+% ============================================================
+% NeuroGS-Codec: Step-by-step Algorithm (Proposal-style)
+% ============================================================
+
+\section{Algorithm: Training a 3D Gaussian Implicit Volume (NeuroGS-Codec)}
+\label{sec:algorithm_proposal_style}
+
+\subsection*{Inputs and Parameters}
+\begin{itemize}
+\item Ground-truth volume $V(\mathbf{x})$ on a discrete voxel grid; normalized to $[0,1]$.
+\item Coordinate domain $\mathbf{x}\in\Omega\subset\mathbb{R}^3$, using normalized coordinates in $[-1,1]^3$.
+\item Number of Gaussians: $N$ (initialized to $N_0$, grows via densification).
+\item Hyperparameters: $\kappa,\lambda,\alpha,\beta_{\mathrm{S}},\beta_{\mathrm{Sm}},\beta_{\mathrm{O}},\beta_{\mathrm{TV}},\beta_{\mathrm{SSIM}},\beta_{\mathrm{Edge}},\beta_{\mathrm{G}}$.
+\item Quantization steps $\Delta_{\mu},\Delta_{\ell},\Delta_{q},\Delta_{a},\Delta_{b}$ (for rate term).
+\end{itemize}
+
+% ------------------------------------------------------------
+\subsection{1. Prepare Training Data and Coordinates}
+\begin{enumerate}
+\item \textbf{Load and normalize the volume:}
+\[
+V \leftarrow \frac{V-\min(V)}{\max(V)-\min(V)+\epsilon}.
+\]
+\item \textbf{Construct a coordinate grid:} for each voxel index $(z,y,x)$ map to a continuous coordinate
+\[
+\mathbf{x}_{zyx} = (x',y',z') \in [-1,1]^3.
+\]
+\item \textbf{Construct a neurite/edge importance map} $m(\mathbf{x})\in[0,1]$ (DoG + gradient magnitude) to emphasize tubular/edge geometry during training.
+\end{enumerate}
+
+% ------------------------------------------------------------
+\subsection{2. Construct the Implicit Function (Gaussian Mixture Field)}
+\begin{enumerate}
+\item \textbf{Define the implicit function} $f(\mathbf{x})$ as a weighted sum of Gaussian basis functions:
+\[
+f(\mathbf{x}) = \sum_{i=1}^{N} a_i\,G_i(\mathbf{x};\boldsymbol{\mu}_i,\boldsymbol{\Sigma}_i) + b.
+\]
+\item \textbf{Define each anisotropic Gaussian basis} as:
+\[
+G_i(\mathbf{x};\boldsymbol{\mu}_i,\boldsymbol{\Sigma}_i)
+=
+\exp\!\left(
+-\frac{1}{2}(\mathbf{x}-\boldsymbol{\mu}_i)^\top \boldsymbol{\Sigma}_i^{-1}(\mathbf{x}-\boldsymbol{\mu}_i)
+\right).
+\]
+\item \textbf{Parameterize the covariance} for stable optimization:
+\[
+\boldsymbol{\Sigma}_i = R(\mathbf{q}_i)\,\mathrm{diag}(\mathbf{s}_i^2)\,R(\mathbf{q}_i)^\top,
+\qquad \mathbf{s}_i=\exp(\boldsymbol{\ell}_i),
+\]
+where $R(\mathbf{q}_i)\in SO(3)$ is a rotation from a unit quaternion $\mathbf{q}_i$ and $\boldsymbol{\ell}_i$ are log-scales.
+\end{enumerate}
+
+% ------------------------------------------------------------
+\subsection{3. Define the Loss Function (Distortion + Rate)}
+\begin{enumerate}
+\item \textbf{Sample $M$ training voxels} $\{(\mathbf{x}_k,v_k,m_k)\}_{k=1}^{M}$, where
+$v_k = V(\mathbf{x}_k)$ and $m_k=m(\mathbf{x}_k)$.
+\item \textbf{Forward prediction:}
+\[
+\hat{v}_k = f(\mathbf{x}_k).
+\]
+\item \textbf{Distortion (geometry-weighted Charbonnier):}
+\[
+\mathcal{L}_{\mathrm{D}}
+=
+\frac{1}{M}\sum_{k=1}^{M}
+\underbrace{(1+\kappa m_k)}_{\text{geometry weight}}
+\underbrace{\sqrt{(\hat{v}_k - v_k)^2+\epsilon^2}}_{\text{Charbonnier}}.
+\]
+\item \textbf{Rate (entropy proxy for quantized parameters):}\\
+Quantize parameters using scalar step sizes $\Delta$:
+\[
+\widehat{\theta} = \mathrm{round}(\theta/\Delta),
+\]
+and estimate expected bits with a Laplace model:
+\[
+\mathcal{L}_{\mathrm{R}}
+=
+\mathcal{R}(\widehat{\boldsymbol{\mu}})
++\mathcal{R}(\widehat{\boldsymbol{\ell}})
++\mathcal{R}(\widehat{\mathbf{q}})
++\mathcal{R}(\widehat{\mathbf{a}})
++\mathcal{R}(\widehat{b}).
+\]
+\end{enumerate}
+
+% ------------------------------------------------------------
+\subsection{4. Regularization Terms (Proposal-style)}
+\begin{enumerate}
+\item \textbf{4.1 Weight Sparsity (encourage fewer active Gaussians):}
+\[
+\mathcal{L}_{\mathrm{S}} = \frac{1}{N}\sum_{i=1}^{N}|a_i|.
+\]
+
+\item \textbf{4.2 Overlap Regularization (discourage redundant Gaussians):}\\
+For sampled pairs $(i,j)$, define
+\[
+d_{ij}^2
+=
+(\boldsymbol{\mu}_i-\boldsymbol{\mu}_j)^\top
+(\boldsymbol{\Sigma}_i+\boldsymbol{\Sigma}_j+\epsilon I)^{-1}
+(\boldsymbol{\mu}_i-\boldsymbol{\mu}_j),
+\qquad
+\mathrm{overlap}_{ij}=\exp(-\tfrac{1}{2}d_{ij}^2),
+\]
+and penalize expected overlap:
+\[
+\mathcal{L}_{\mathrm{O}}=\mathbb{E}_{(i,j)}[\mathrm{overlap}_{ij}].
+\]
+
+\item \textbf{4.3 Smoothness Regularization (two levels):}
+\begin{itemize}
+\item \emph{Field smoothness (closest to “smooth transitions”):}
+\[
+\mathcal{L}_{\mathrm{G}}=\mathbb{E}_{\mathbf{x}\sim\Omega}\big[\|\nabla_{\mathbf{x}} f(\mathbf{x})\|_2^2\big].
+\]
+\item \emph{Parameter conditioning (covariance stability):}
+\[
+\mathcal{L}_{\mathrm{Sm}}=
+\text{penalty to keep scales bounded and avoid extreme anisotropy}.
+\]
+\end{itemize}
+
+\item \textbf{4.4 Patch TV (piecewise smooth geometry):}
+\[
+\mathcal{L}_{\mathrm{TV}} = \mathbb{E}_{\mathcal{P}}\big[\|\nabla f\|_1\big].
+\]
+
+\item \textbf{4.5 Patch SSIM (structure preservation):}
+\[
+\mathcal{L}_{\mathrm{SSIM}} = 1-\mathrm{SSIM}(f(\mathcal{P}),V(\mathcal{P})).
+\]
+
+\item \textbf{4.6 Edge-aware reconstruction (boundary alignment):}
+\[
+\mathcal{L}_{\mathrm{Edge}}
+=
+\mathbb{E}_{\mathbf{x}\in\mathcal{P}}\big[w_{\mathrm{edge}}(\mathbf{x})|f(\mathbf{x})-V(\mathbf{x})|\big].
+\]
+
+\item \textbf{4.7 (Optional) Topology-biased patch loss (neurite continuity):}
+\[
+\mathcal{L}_{\mathrm{T}}
+=
+\mathrm{TV}(\sigma(\gamma(f-\tau))) + c_h\| \sigma(\gamma(f-\tau))-\mathrm{LPF}(\sigma(\gamma(f-\tau)))\|_1.
+\]
+\end{enumerate}
+
+% ------------------------------------------------------------
+\subsection{5. Total Objective}
+\begin{equation}
+\mathcal{L}_{\mathrm{Total}}
+=
+\mathcal{L}_{\mathrm{D}}
++ \lambda\,\mathcal{L}_{\mathrm{R}}
++ \alpha\,\mathcal{L}_{\mathrm{T}}
++ \beta_{\mathrm{TV}}\mathcal{L}_{\mathrm{TV}}
++ \beta_{\mathrm{SSIM}}\mathcal{L}_{\mathrm{SSIM}}
++ \beta_{\mathrm{Edge}}\mathcal{L}_{\mathrm{Edge}}
++ \beta_{\mathrm{G}}\mathcal{L}_{\mathrm{G}}
++ \beta_{\mathrm{S}}\mathcal{L}_{\mathrm{S}}
++ \beta_{\mathrm{Sm}}\mathcal{L}_{\mathrm{Sm}}
++ \beta_{\mathrm{O}}\mathcal{L}_{\mathrm{O}}.
+\label{eq:total_objective}
+\end{equation}
+
+% ------------------------------------------------------------
+\subsection{6. Optimize Gaussian Parameters and Weights (Gradient-Based)}
+\begin{enumerate}
+\item Initialize parameters $\{\boldsymbol{\mu}_i,\boldsymbol{\ell}_i,\mathbf{q}_i,a_i\}_{i=1}^{N}$ and $b$
+(using importance sampling from $m(\mathbf{x})$).
+\item Use Adam optimizer:
+\[
+\theta \leftarrow \theta - \eta \nabla_{\theta}\mathcal{L}_{\mathrm{Total}},
+\quad
+\theta \in \{\boldsymbol{\mu},\boldsymbol{\ell},\mathbf{q},\mathbf{a},b\}.
+\]
+\item Backpropagate through the Gaussian basis functions via automatic differentiation.
+\end{enumerate}
+
+% ------------------------------------------------------------
+\subsection{7. Iterative Training Loop (Proposal-style)}
+\begin{enumerate}
+\item \textbf{Sample voxel data:}
+Randomly sample a batch of voxel coordinates (half uniform, half importance-weighted by $m(\mathbf{x})$).
+\item \textbf{Forward pass:}
+Compute predictions $\hat{v}_k=f(\mathbf{x}_k)$.
+\item \textbf{Compute loss:}
+Evaluate $\mathcal{L}_{\mathrm{Total}}$ from Eq.~\eqref{eq:total_objective}.
+\item \textbf{Backpropagation:}
+Compute gradients $\nabla_{\theta}\mathcal{L}_{\mathrm{Total}}$.
+\item \textbf{Update parameters:}
+Apply Adam update to all Gaussian parameters and entropy-model parameters.
+\end{enumerate}
+
+% ------------------------------------------------------------
+\subsection{8. Densification and Pruning (Adaptive Gaussian Allocation)}
+\begin{enumerate}
+\item Accumulate gradient statistics for each Gaussian mean:
+\[
+g_i \leftarrow \|\nabla_{\boldsymbol{\mu}_i}\mathcal{L}_{\mathrm{Total}}\|_2.
+\]
+\item Every $K$ iterations (densify interval), apply:
+\begin{itemize}
+\item \textbf{Split:} if $g_i$ is large and the Gaussian is too large, split it into multiple smaller Gaussians.
+\item \textbf{Clone:} if $g_i$ is large but the Gaussian is already small, clone to increase local capacity.
+\item \textbf{Prune:} remove Gaussians with small amplitude $|a_i|<\tau_a$ or excessively large scale.
+\end{itemize}
+\item Continue training with updated $N$.
+\end{enumerate}
+
+% ------------------------------------------------------------
+\subsection{9. Stopping Criterion and Output}
+\begin{enumerate}
+\item Stop after a fixed number of iterations, or apply early stopping based on a validation distortion metric.
+\item Output the trained Gaussian parameters $\{\boldsymbol{\mu}_i,\boldsymbol{\ell}_i,\mathbf{q}_i,a_i\}_{i=1}^{N}$, bias $b$, and entropy-model parameters for compression.
+\end{enumerate}
+
+\section{Objective Function and Regularization}
+\label{sec:loss_regularization}
+
+\subsection{Implicit volume representation}
+\label{subsec:implicit_function}
+
+We represent a normalized volumetric signal $V:\Omega\subset\mathbb{R}^3\rightarrow \mathbb{R}$ using a sparse mixture of anisotropic 3D Gaussian basis functions. In the notation of the proposals (Step 2), the implicit function is
+\begin{equation}
+f(\mathbf{x})
+= \sum_{i=1}^{N} w_i\, G_i(\mathbf{x};\mathbf{u}_i,\boldsymbol{\Sigma}_i),
+\qquad \mathbf{x}\in\Omega,
+\label{eq:proposal_implicit}
+\end{equation}
+where the Gaussian basis is
+\begin{equation}
+G_i(\mathbf{x};\mathbf{u}_i,\boldsymbol{\Sigma}_i)
+= \exp\!\left(
+-\frac{1}{2}\,(\mathbf{x}-\mathbf{u}_i)^{\top}\boldsymbol{\Sigma}_i^{-1}(\mathbf{x}-\mathbf{u}_i)
+\right).
+\label{eq:proposal_gaussian}
+\end{equation}
+
+\paragraph{Mapping to our code.}
+Our implementation uses the same functional form but with parameters re-parameterized for stable optimization:
+\begin{itemize}
+    \item Mean $\mathbf{u}_i \leftrightarrow \boldsymbol{\mu}_i \in \mathbb{R}^3$ (parameter \texttt{model.mu}).
+    \item Covariance $\boldsymbol{\Sigma}_i$ is represented via a rotation $R(\mathbf{q}_i)\in SO(3)$ and axis scales $\mathbf{s}_i\in\mathbb{R}_+^3$:
+    \begin{equation}
+    \boldsymbol{\Sigma}_i
+    = R(\mathbf{q}_i)\,\mathrm{diag}(\mathbf{s}_i^2)\,R(\mathbf{q}_i)^{\top},
+    \qquad \mathbf{s}_i = \exp(\boldsymbol{\ell}_i),
+    \label{eq:cov_param}
+    \end{equation}
+    where $\boldsymbol{\ell}_i\in\mathbb{R}^3$ are log-scales (\texttt{model.log\_s}) and $\mathbf{q}_i\in\mathbb{R}^4$ is a quaternion (\texttt{model.q}) normalized to unit length.
+    \item Mixture weight $w_i \leftrightarrow a_i$ (amplitude, \texttt{model.a}) and a global bias $b$ (\texttt{model.b}):
+    \begin{equation}
+    f(\mathbf{x}) = \sum_{i=1}^{N} a_i \, \exp\!\left(-\tfrac{1}{2}\,\lVert D_i^{-1} R(\mathbf{q}_i)^{\top}(\mathbf{x}-\boldsymbol{\mu}_i)\rVert_2^2\right) + b,
+    \label{eq:our_forward}
+    \end{equation}
+    with $D_i=\mathrm{diag}(\mathbf{s}_i)$.
+\end{itemize}
+
+\subsection{Data fidelity term}
+\label{subsec:data_term}
+
+\paragraph{Proposal formulation (Step 3).}
+The proposals define the reconstruction loss as mean squared error (MSE):
+\begin{equation}
+\mathcal{L}_{\mathrm{MSE}}
+= \frac{1}{M}\sum_{k=1}^{M}\left(f(\mathbf{x}_k)-v_k\right)^2,
+\label{eq:proposal_mse}
+\end{equation}
+where $\{(\mathbf{x}_k,v_k)\}_{k=1}^M$ are sampled voxel coordinates and their ground-truth intensities.
+
+\paragraph{Our implementation.}
+We replace pure MSE with a (weighted) Charbonnier penalty to increase robustness to outliers and heavy-tailed noise typical in microscopy (shot noise, sparse bright structures):
+\begin{align}
+\mathcal{L}_{\mathrm{D}}
+&= \frac{1}{M}\sum_{k=1}^{M} \omega(\mathbf{x}_k)\,
+\rho\!\left(f(\mathbf{x}_k)-v_k\right),
+\label{eq:data_charb}\\
+\rho(r) &= \sqrt{r^2+\epsilon^2},
+\qquad
+\omega(\mathbf{x}) = 1+\kappa\, m(\mathbf{x}).
+\label{eq:charb_weight}
+\end{align}
+Here $m(\mathbf{x})\in[0,1]$ is a neurite/edge importance map (constructed from DoG + gradient magnitude), and $\kappa$ (named \texttt{kappa} in the config) emphasizes geometrically important regions (neurites, boundaries). This makes the training geometry-aware without requiring explicit segmentation labels.
+
+\paragraph{Comparison to the proposals.}
+Equation~\eqref{eq:data_charb} is a strict generalization of~\eqref{eq:proposal_mse}:
+\begin{itemize}
+    \item If $\omega(\mathbf{x})\equiv 1$ and $\rho(r)=r^2$, we recover the proposal MSE.
+    \item Our choice $\rho(r)=\sqrt{r^2+\epsilon^2}$ behaves like $|r|$ for large residuals, preventing a small number of extreme voxels from dominating early training.
+    \item The weight $\omega(\mathbf{x})$ explicitly prioritizes geometric correctness (edges / filamentary structures).
+\end{itemize}
+
+\subsection{Rate term (compression-aware training)}
+\label{subsec:rate_term}
+
+To train a \emph{codec}, we optimize a rate--distortion objective by adding an entropy-based rate proxy. We quantize parameters using uniform scalar steps $\Delta$ (straight-through estimator for gradients):
+\begin{equation}
+\widehat{\theta} = Q(\theta) \approx \mathrm{round}\!\left(\frac{\theta}{\Delta}\right),
+\label{eq:quant}
+\end{equation}
+and estimate the expected code length (in bits) by a Laplace entropy model:
+\begin{equation}
+\mathcal{R}(\widehat{\theta})
+= \mathbb{E}\big[-\log_2 p_{\mathrm{Lap}}(\widehat{\theta})\big].
+\label{eq:rate_bits}
+\end{equation}
+In our code, we sum per-parameter groups:
+\begin{equation}
+\mathcal{L}_{\mathrm{R}}
+=
+\mathcal{R}(\widehat{\boldsymbol{\mu}})
++\mathcal{R}(\widehat{\boldsymbol{\ell}})
++\mathcal{R}(\widehat{\mathbf{q}})
++\mathcal{R}(\widehat{\mathbf{a}})
++\mathcal{R}(\widehat{b}).
+\label{eq:rate_total}
+\end{equation}
+This term is not present in the proposals because they describe only the fitting problem, not compression. In a codec setting, $\mathcal{L}_{\mathrm{R}}$ is essential to trade off fidelity vs.\ bitrate.
+
+\subsection{Regularization terms}
+\label{subsec:regularizers}
+
+The proposals (Step 6) list three regularizers: sparsity, overlap, and smoothness. Our implementation contains counterparts, but some are refined to better match 3D anisotropic Gaussians and geometric priorities.
+
+\subsubsection{Sparsity regularization}
+\label{subsubsec:sparsity}
+
+\paragraph{Proposal.}
+\begin{equation}
+\mathcal{L}_{\mathrm{sparsity}}^{\text{(shot)}}
+= \lambda_w\sum_{i=1}^{N}|w_i|.
+\label{eq:proposal_sparse}
+\end{equation}
+
+\paragraph{Our code.}
+We apply the same principle to amplitudes $a_i$:
+\begin{equation}
+\mathcal{L}_{\mathrm{S}}
+= \frac{1}{N}\sum_{i=1}^{N}|a_i|.
+\label{eq:ours_sparse}
+\end{equation}
+
+\paragraph{Reason (geometry + compression).}
+$\ell_1$ sparsity encourages many Gaussians to become negligible and later removable by pruning (e.g., \texttt{min\_amplitude}), directly improving compression (fewer primitives) and helping geometric correctness by preventing diffuse background ``fog''.
+
+\subsubsection{Overlap regularization}
+\label{subsubsec:overlap}
+
+\paragraph{Proposal.}
+The proposals describe an abstract pairwise overlap penalty:
+\begin{equation}
+\mathcal{L}_{\mathrm{overlap}}^{\text{(shot)}}
+= \lambda_o \sum_{i,j} \mathrm{overlap}(G_i,G_j),
+\label{eq:proposal_overlap}
+\end{equation}
+without specifying the exact overlap operator.
+
+\paragraph{Our code (orientation-aware overlap).}
+We instantiate overlap via a Mahalanobis distance under the combined covariance $(\Sigma_i+\Sigma_j)$:
+\begin{align}
+d^2_{ij}
+&=
+(\boldsymbol{\mu}_i-\boldsymbol{\mu}_j)^{\top}
+(\boldsymbol{\Sigma}_i+\boldsymbol{\Sigma}_j+\epsilon I)^{-1}
+(\boldsymbol{\mu}_i-\boldsymbol{\mu}_j),
+\label{eq:mahal_dist}\\
+\mathrm{overlap}_{ij}
+&= \exp\!\left(-\tfrac{1}{2} d^2_{ij}\right),
+\qquad
+\mathcal{L}_{\mathrm{O}}
+= \mathbb{E}_{(i,j)\sim\mathcal{P}}\big[\mathrm{overlap}_{ij}\big],
+\label{eq:mahal_overlap}
+\end{align}
+where $\mathcal{P}$ is a sampled set of random pairs for efficiency.
+
+\paragraph{Comparison to the proposals.}
+Equation~\eqref{eq:mahal_overlap} is a concrete, geometry-consistent realization of~\eqref{eq:proposal_overlap}:
+\begin{itemize}
+    \item It accounts for \emph{anisotropy and orientation} (through $\Sigma_i$), which is critical for tubular structures (neurites, vessels).
+    \item It penalizes redundant primitives that occupy the same spatial support, improving identifiability and geometric crispness.
+    \item A simpler isotropic proxy (e.g., $\exp(-\|\mu_i-\mu_j\|/(r_i+r_j))$) ignores orientation and is less faithful to true Gaussian overlap in 3D.
+\end{itemize}
+
+\subsubsection{Smoothness regularization: proposal vs.\ our implementation}
+\label{subsubsec:smoothness}
+
+\paragraph{Proposal.}
+The proposals state:
+\begin{equation}
+\mathcal{L}_{\mathrm{smooth}}^{\text{(shot)}}
+= \lambda_s \sum_{i=1}^{N}\left\lVert \nabla_{\mathbf{u}_i} G_i \right\rVert_2^2.
+\label{eq:proposal_smooth}
+\end{equation}
+This is a \emph{Gaussian-parameter} smoothness written in terms of the gradient of each basis w.r.t.\ its mean $\mathbf{u}_i$.
+
+\paragraph{Our code contains two different ``smoothness'' notions.}
+
+\begin{enumerate}
+\item \textbf{Parameter conditioning (named \texttt{smoothness\_loss(model)}).}
+We regularize the covariance parameters to keep primitives well-conditioned:
+\begin{equation}
+\mathcal{L}_{\mathrm{Sm}}
+=
+\underbrace{\mathbb{E}_i\big[\max(0, s_{\min}-s_i)\big]}_{\text{avoid collapse}}
++
+c_a\underbrace{\mathbb{E}_i\Big[\max(0,\tfrac{s_{i,\max}}{s_{i,\min}}-1)\Big]}_{\text{limit extreme anisotropy}}
++
+c_m\underbrace{\mathbb{E}_i\big[\max(0, s_i-s_{\max})\big]}_{\text{avoid blow-up}},
+\label{eq:param_smooth}
+\end{equation}
+where $s_i=\exp(\ell_i)$ are axis scales. This does \emph{not} match~\eqref{eq:proposal_smooth}; it is a stability/conditioning prior for $\Sigma_i$.
+
+\item \textbf{Field smoothness (named \texttt{field\_grad\_smoothness}).}
+To align with the proposal intent of ``smooth transitions'', we add a reconstruction-field gradient penalty:
+\begin{equation}
+\mathcal{L}_{\mathrm{G}}
+=
+\mathbb{E}_{\mathbf{x}\sim\Omega}\Big[\lVert \nabla_{\mathbf{x}} f(\mathbf{x}) \rVert_2^2\Big],
+\label{eq:field_grad_smooth}
+\end{equation}
+estimated by autograd on randomly sampled coordinates.
+This is \emph{closer in spirit} to smoothness in implicit fields (and more directly geometry-aligned), even though its gradient is w.r.t.\ $\mathbf{x}$ rather than $\mathbf{u}_i$.
+\end{enumerate}
+
+\paragraph{Why the proposal smoothness is not identical.}
+$\nabla_{\mathbf{u}_i}G_i$ (proposal) and $\nabla_{\mathbf{x}} f(\mathbf{x})$ (ours) are different objects:
+\begin{itemize}
+    \item $\nabla_{\mathbf{u}_i}G_i$ constrains how sensitive each \emph{basis} is to moving its center, i.e., it is a parameter-space smoothness.
+    \item $\nabla_{\mathbf{x}} f(\mathbf{x})$ constrains the reconstructed \emph{field geometry} directly in spatial coordinates, which is typically what we want for geometric correctness (suppressing spurious oscillations/ringing).
+\end{itemize}
+
+\paragraph{Geometric priority recommendation.}
+For geometry-first training, $\mathcal{L}_{\mathrm{G}}$ (field gradient) and/or TV on patches (below) are the most directly geometry-aligned. $\mathcal{L}_{\mathrm{Sm}}$ should be kept as a covariance-conditioning prior (prevents degenerate Gaussians), but it should be described separately from proposal ``smoothness''.
+
+\subsubsection{Total variation (TV) on reconstructed patches}
+\label{subsubsec:tv}
+
+We also use 3D total variation on predicted patches:
+\begin{equation}
+\mathcal{L}_{\mathrm{TV}}
+=
+\mathbb{E}_{\mathcal{P}}
+\Big[
+\lVert \nabla_x f \rVert_1 + \lVert \nabla_y f \rVert_1 + \lVert \nabla_z f \rVert_1
+\Big],
+\label{eq:tv}
+\end{equation}
+computed on local subvolumes for efficiency. TV encourages piecewise-smooth reconstructions while preserving sharp boundaries, complementing the Charbonnier data term for geometric fidelity.
+
+\subsubsection{SSIM (structure-preserving regularizer)}
+\label{subsubsec:ssim}
+
+We include a 3D SSIM loss on patches:
+\begin{equation}
+\mathcal{L}_{\mathrm{SSIM}} = 1 - \mathrm{SSIM}(f(\mathcal{P}), V(\mathcal{P})),
+\label{eq:ssim}
+\end{equation}
+where SSIM is computed from local means/variances/covariances within a small 3D window. While not in the proposals, SSIM stabilizes perceptual/structural similarity and reduces over-smoothing that can occur with TV alone.
+
+\subsubsection{Edge-aware loss (geometry-weighted fidelity)}
+\label{subsubsec:edge}
+
+We apply an edge-weighted absolute error on patches:
+\begin{equation}
+\mathcal{L}_{\mathrm{Edge}}
+=
+\mathbb{E}_{\mathbf{x}\in\mathcal{P}}
+\Big[
+w_{\mathrm{edge}}(\mathbf{x})\,|f(\mathbf{x})-V(\mathbf{x})|
+\Big],
+\label{eq:edge}
+\end{equation}
+with $w_{\mathrm{edge}}$ constructed from finite differences of the target patch plus the neurite map. This explicitly prioritizes boundary alignment and filament continuity, which is central for geometric correctness in dendritic/vascular volumes.
+
+\subsubsection{Topology-biased patch loss (optional)}
+\label{subsubsec:topology}
+
+We include a lightweight topology-biased loss by mapping predictions to a soft occupancy via a sigmoid threshold and penalizing high-frequency artifacts (TV + high-frequency residual) on that occupancy:
+\begin{equation}
+\mathcal{L}_{\mathrm{T}}
+=
+\mathrm{TV}\big(\sigma(\gamma(f-\tau))\big)
++ c_h\,\big\lVert \sigma(\gamma(f-\tau)) - \mathrm{LPF}(\sigma(\gamma(f-\tau))) \big\rVert_1.
+\label{eq:topo}
+\end{equation}
+This is not in the proposals, but it is used to bias the solution toward coherent neurite-like occupancy patterns when training from sparse samples.
+
+\subsection{Final objective (rate--distortion with geometric priors)}
+\label{subsec:final_objective}
+
+Combining all terms, the full training objective in our code is:
+\begin{align}
+\min_{\{\mu_i,\ell_i,q_i,a_i\},\,b}\;
+\mathcal{L}_{\mathrm{Total}}
+&=
+\mathcal{L}_{\mathrm{D}}
++ \lambda\,\mathcal{L}_{\mathrm{R}}
++ \alpha\,\mathcal{L}_{\mathrm{T}}
++ \beta_{\mathrm{TV}}\,\mathcal{L}_{\mathrm{TV}}
++ \beta_{\mathrm{SSIM}}\,\mathcal{L}_{\mathrm{SSIM}}
++ \beta_{\mathrm{Edge}}\,\mathcal{L}_{\mathrm{Edge}}
+\nonumber\\
+&\quad
++ \beta_{\mathrm{G}}\,\mathcal{L}_{\mathrm{G}}
++ \beta_{\mathrm{S}}\,\mathcal{L}_{\mathrm{S}}
++ \beta_{\mathrm{Sm}}\,\mathcal{L}_{\mathrm{Sm}}
++ \beta_{\mathrm{O}}\,\mathcal{L}_{\mathrm{O}}.
+\label{eq:full_loss}
+\end{align}
+
+\subsection{Direct comparison to the proposals (what matches, what differs)}
+\label{subsec:compare_proposals}
+
+\begin{itemize}
+    \item \textbf{Implicit function:} Matches the proposal form (Eq.~\eqref{eq:proposal_implicit}--\eqref{eq:proposal_gaussian}) but uses a rotation+log-scale parameterization for $\Sigma_i$ (Eq.~\eqref{eq:cov_param}) and includes a bias $b$.
+    \item \textbf{Data loss:} Proposal uses MSE (Eq.~\eqref{eq:proposal_mse}); we use weighted Charbonnier (Eq.~\eqref{eq:data_charb}) to prioritize neurites/edges and improve robustness.
+    \item \textbf{Sparsity:} Same idea as proposal $\ell_1$ on weights, applied to amplitudes $a_i$ (Eq.~\eqref{eq:ours_sparse}).
+    \item \textbf{Overlap:} Proposal leaves overlap unspecified (Eq.~\eqref{eq:proposal_overlap}); we implement an anisotropy- and orientation-aware overlap via Mahalanobis distance (Eq.~\eqref{eq:mahal_overlap}), which is more geometrically correct for tubular primitives.
+    \item \textbf{Smoothness:} Proposal smoothness is written as $\sum\|\nabla_{u_i}G_i\|^2$ (Eq.~\eqref{eq:proposal_smooth}). Our \texttt{smoothness\_loss(model)} is instead a covariance-conditioning prior (Eq.~\eqref{eq:param_smooth}). For geometry-aligned smoothness, our \texttt{field\_grad\_smoothness} (Eq.~\eqref{eq:field_grad_smooth}) and TV (Eq.~\eqref{eq:tv}) are closer to the proposal intent of ``smooth transitions'' in the reconstructed volume.
+\end{itemize}
+
+\end{document}

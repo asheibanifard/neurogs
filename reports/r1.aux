@@ -1,0 +1,82 @@
+\relax 
+\providecommand\hyper@newdestlabel[2]{}
+\providecommand\HyField@AuxAddToFields[1]{}
+\providecommand\HyField@AuxAddToCoFields[2]{}
+\@writefile{toc}{\contentsline {section}{\numberline {1}Algorithm: Training a 3D Gaussian Implicit Volume (NeuroGS-Codec)}{1}{section.1}\protected@file@percent }
+\newlabel{sec:algorithm_proposal_style}{{1}{1}{Algorithm: Training a 3D Gaussian Implicit Volume (NeuroGS-Codec)}{section.1}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {1.1}1. Prepare Training Data and Coordinates}{1}{subsection.1.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {1.2}2. Construct the Implicit Function (Gaussian Mixture Field)}{1}{subsection.1.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {1.3}3. Define the Loss Function (Distortion + Rate)}{2}{subsection.1.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {1.4}4. Regularization Terms (Proposal-style)}{2}{subsection.1.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {1.5}5. Total Objective}{3}{subsection.1.5}\protected@file@percent }
+\newlabel{eq:total_objective}{{1}{3}{5. Total Objective}{equation.1.1}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {1.6}6. Optimize Gaussian Parameters and Weights (Gradient-Based)}{3}{subsection.1.6}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {1.7}7. Iterative Training Loop (Proposal-style)}{3}{subsection.1.7}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {1.8}8. Densification and Pruning (Adaptive Gaussian Allocation)}{3}{subsection.1.8}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {1.9}9. Stopping Criterion and Output}{3}{subsection.1.9}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {2}Objective Function and Regularization}{4}{section.2}\protected@file@percent }
+\newlabel{sec:loss_regularization}{{2}{4}{Objective Function and Regularization}{section.2}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {2.1}Implicit volume representation}{4}{subsection.2.1}\protected@file@percent }
+\newlabel{subsec:implicit_function}{{2.1}{4}{Implicit volume representation}{subsection.2.1}{}}
+\newlabel{eq:proposal_implicit}{{2}{4}{Implicit volume representation}{equation.2.2}{}}
+\newlabel{eq:proposal_gaussian}{{3}{4}{Implicit volume representation}{equation.2.3}{}}
+\@writefile{toc}{\contentsline {paragraph}{Mapping to our code.}{4}{section*.2}\protected@file@percent }
+\newlabel{eq:cov_param}{{4}{4}{Mapping to our code}{equation.2.4}{}}
+\newlabel{eq:our_forward}{{5}{4}{Mapping to our code}{equation.2.5}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {2.2}Data fidelity term}{4}{subsection.2.2}\protected@file@percent }
+\newlabel{subsec:data_term}{{2.2}{4}{Data fidelity term}{subsection.2.2}{}}
+\@writefile{toc}{\contentsline {paragraph}{Proposal formulation (Step 3).}{4}{section*.3}\protected@file@percent }
+\newlabel{eq:proposal_mse}{{6}{4}{Proposal formulation (Step 3)}{equation.2.6}{}}
+\@writefile{toc}{\contentsline {paragraph}{Our implementation.}{4}{section*.4}\protected@file@percent }
+\newlabel{eq:data_charb}{{7}{4}{Our implementation}{equation.2.7}{}}
+\newlabel{eq:charb_weight}{{8}{4}{Our implementation}{equation.2.8}{}}
+\@writefile{toc}{\contentsline {paragraph}{Comparison to the proposals.}{5}{section*.5}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {2.3}Rate term (compression-aware training)}{5}{subsection.2.3}\protected@file@percent }
+\newlabel{subsec:rate_term}{{2.3}{5}{Rate term (compression-aware training)}{subsection.2.3}{}}
+\newlabel{eq:quant}{{9}{5}{Rate term (compression-aware training)}{equation.2.9}{}}
+\newlabel{eq:rate_bits}{{10}{5}{Rate term (compression-aware training)}{equation.2.10}{}}
+\newlabel{eq:rate_total}{{11}{5}{Rate term (compression-aware training)}{equation.2.11}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {2.4}Regularization terms}{5}{subsection.2.4}\protected@file@percent }
+\newlabel{subsec:regularizers}{{2.4}{5}{Regularization terms}{subsection.2.4}{}}
+\@writefile{toc}{\contentsline {subsubsection}{\numberline {2.4.1}Sparsity regularization}{5}{subsubsection.2.4.1}\protected@file@percent }
+\newlabel{subsubsec:sparsity}{{2.4.1}{5}{Sparsity regularization}{subsubsection.2.4.1}{}}
+\@writefile{toc}{\contentsline {paragraph}{Proposal.}{5}{section*.6}\protected@file@percent }
+\newlabel{eq:proposal_sparse}{{12}{5}{Proposal}{equation.2.12}{}}
+\@writefile{toc}{\contentsline {paragraph}{Our code.}{5}{section*.7}\protected@file@percent }
+\newlabel{eq:ours_sparse}{{13}{5}{Our code}{equation.2.13}{}}
+\@writefile{toc}{\contentsline {paragraph}{Reason (geometry + compression).}{5}{section*.8}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsubsection}{\numberline {2.4.2}Overlap regularization}{5}{subsubsection.2.4.2}\protected@file@percent }
+\newlabel{subsubsec:overlap}{{2.4.2}{5}{Overlap regularization}{subsubsection.2.4.2}{}}
+\@writefile{toc}{\contentsline {paragraph}{Proposal.}{5}{section*.9}\protected@file@percent }
+\newlabel{eq:proposal_overlap}{{14}{5}{Proposal}{equation.2.14}{}}
+\@writefile{toc}{\contentsline {paragraph}{Our code (orientation-aware overlap).}{6}{section*.10}\protected@file@percent }
+\newlabel{eq:mahal_dist}{{15}{6}{Our code (orientation-aware overlap)}{equation.2.15}{}}
+\newlabel{eq:mahal_overlap}{{16}{6}{Our code (orientation-aware overlap)}{equation.2.16}{}}
+\@writefile{toc}{\contentsline {paragraph}{Comparison to the proposals.}{6}{section*.11}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsubsection}{\numberline {2.4.3}Smoothness regularization: proposal vs.\ our implementation}{6}{subsubsection.2.4.3}\protected@file@percent }
+\newlabel{subsubsec:smoothness}{{2.4.3}{6}{Smoothness regularization: proposal vs.\ our implementation}{subsubsection.2.4.3}{}}
+\@writefile{toc}{\contentsline {paragraph}{Proposal.}{6}{section*.12}\protected@file@percent }
+\newlabel{eq:proposal_smooth}{{17}{6}{Proposal}{equation.2.17}{}}
+\@writefile{toc}{\contentsline {paragraph}{Our code contains two different ``smoothness'' notions.}{6}{section*.13}\protected@file@percent }
+\newlabel{eq:param_smooth}{{18}{6}{Our code contains two different ``smoothness'' notions}{equation.2.18}{}}
+\newlabel{eq:field_grad_smooth}{{19}{6}{Our code contains two different ``smoothness'' notions}{equation.2.19}{}}
+\@writefile{toc}{\contentsline {paragraph}{Why the proposal smoothness is not identical.}{6}{section*.14}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Geometric priority recommendation.}{7}{section*.15}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsubsection}{\numberline {2.4.4}Total variation (TV) on reconstructed patches}{7}{subsubsection.2.4.4}\protected@file@percent }
+\newlabel{subsubsec:tv}{{2.4.4}{7}{Total variation (TV) on reconstructed patches}{subsubsection.2.4.4}{}}
+\newlabel{eq:tv}{{20}{7}{Total variation (TV) on reconstructed patches}{equation.2.20}{}}
+\@writefile{toc}{\contentsline {subsubsection}{\numberline {2.4.5}SSIM (structure-preserving regularizer)}{7}{subsubsection.2.4.5}\protected@file@percent }
+\newlabel{subsubsec:ssim}{{2.4.5}{7}{SSIM (structure-preserving regularizer)}{subsubsection.2.4.5}{}}
+\newlabel{eq:ssim}{{21}{7}{SSIM (structure-preserving regularizer)}{equation.2.21}{}}
+\@writefile{toc}{\contentsline {subsubsection}{\numberline {2.4.6}Edge-aware loss (geometry-weighted fidelity)}{7}{subsubsection.2.4.6}\protected@file@percent }
+\newlabel{subsubsec:edge}{{2.4.6}{7}{Edge-aware loss (geometry-weighted fidelity)}{subsubsection.2.4.6}{}}
+\newlabel{eq:edge}{{22}{7}{Edge-aware loss (geometry-weighted fidelity)}{equation.2.22}{}}
+\@writefile{toc}{\contentsline {subsubsection}{\numberline {2.4.7}Topology-biased patch loss (optional)}{7}{subsubsection.2.4.7}\protected@file@percent }
+\newlabel{subsubsec:topology}{{2.4.7}{7}{Topology-biased patch loss (optional)}{subsubsection.2.4.7}{}}
+\newlabel{eq:topo}{{23}{7}{Topology-biased patch loss (optional)}{equation.2.23}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {2.5}Final objective (rate--distortion with geometric priors)}{7}{subsection.2.5}\protected@file@percent }
+\newlabel{subsec:final_objective}{{2.5}{7}{Final objective (rate--distortion with geometric priors)}{subsection.2.5}{}}
+\newlabel{eq:full_loss}{{24}{7}{Final objective (rate--distortion with geometric priors)}{equation.2.24}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {2.6}Direct comparison to the proposals (what matches, what differs)}{8}{subsection.2.6}\protected@file@percent }
+\newlabel{subsec:compare_proposals}{{2.6}{8}{Direct comparison to the proposals (what matches, what differs)}{subsection.2.6}{}}
+\gdef \@abspage@last{8}
