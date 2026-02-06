@@ -1,0 +1,279 @@
+\documentclass[11pt]{article}
+
+% Required packages
+\usepackage[utf8]{inputenc}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage{booktabs}
+
+\begin{document}
+
+% ======================================================================
+% Experiments
+% ======================================================================
+\section{Experiments}
+\label{sec:experiments}
+
+\subsection{Datasets}
+\label{sec:datasets}
+We evaluate NeuroGS-Codec on volumetric microscopy datasets containing neurite-like filamentary structures and sparse background. 
+All volumes are stored as 3D tensors $V \in [0,1]^{Z \times Y \times X}$ after intensity normalization.
+In our main results, we use \textcolor{red}{[DATASET NAME(S)]} with imaging modality \textcolor{red}{[e.g., confocal / light-sheet / two-photon]}, voxel spacing \textcolor{red}{[$(\Delta x,\Delta y,\Delta z)$]}, and typical volume size \textcolor{red}{[$Z\times Y\times X$]}.
+We provide additional results on \textcolor{red}{[SECOND DATASET / ADDITIONAL SAMPLES]} to test generalization across acquisitions.
+
+\textbf{Preprocessing.}
+Each volume is normalized using min--max normalization, 
+$V \leftarrow (V - \min(V))/(\max(V)-\min(V)+\epsilon)$, with $\epsilon=10^{-8}$.
+To bias sampling and reconstruction toward neurite structures, we compute a neurite saliency map $M \in [0,1]^{Z \times Y \times X}$ using a Difference-of-Gaussians (DoG) and gradient magnitude proxy (details in Sec.~\textcolor{red}{[METHOD SECTION REF]}).
+\textcolor{red}{[IF YOU HAVE TRAIN/VAL SPLITS: describe how you split volumes or patches.]}
+
+% ------------------------------
+\subsection{Baselines}
+\label{sec:baselines}
+We compare NeuroGS-Codec against classical and neural baselines representing common trade-offs in volumetric compression.
+
+\textbf{Lossless classical codecs.}
+We include TIFF-LZW, TIFF-Deflate, HDF5+gzip, and Zarr+Blosc-zstd as standard archival baselines.
+
+\textbf{Lossy classical codecs.}
+We include JPEG2000 (slice-wise) and H.265/HEVC (treating $z$-slices as video frames).
+For 2D codecs, we compress each axial slice independently and reconstruct the full volume by stacking slices.
+
+\textbf{Neural implicit baselines.}
+We include coordinate-based implicit neural representation (INR) baselines:
+(i) SIREN-3D, and (ii) PE-MLP (Fourier features).
+We ensure comparable optimization budgets and compute bitrate via 8-bit weight quantization + gzip compression.
+
+\textbf{Implementation notes for fairness.}
+All methods operate on the same normalized input volumes and are evaluated on the same metrics.
+Where applicable, we report both \textit{compressed size} (true bytes on disk) and \textit{estimated rate} (e.g., entropy surrogate), clearly labeled in tables.
+
+% ------------------------------
+\subsection{Evaluation Metrics}
+\label{sec:metrics}
+We evaluate rate--distortion performance and geometric fidelity.
+
+\textbf{Rate.}
+We report bits-per-voxel (bpv) defined as
+$\text{bpv} = \frac{8 \cdot \text{file\_size\_bytes}}{Z Y X}$.
+For neural methods, we compute rate as serialized parameter bytes (8-bit quantized + gzip compressed).
+
+\textbf{Distortion.}
+We report (i) PSNR, (ii) 3D SSIM, and (iii) slice-wise SSIM averaged across $z$.
+Additionally, to emphasize morphology-critical regions, we report an edge-focused error using a high-gradient mask $E$ (top 10\% gradients) and a flat-region mask $F$:
+\begin{align}
+\text{MAE}_{\text{edge}} &= \frac{1}{|E|}\sum_{(z,y,x)\in E}\left| \hat{V}_{z,y,x} - V_{z,y,x}\right|, \\
+\text{MAE}_{\text{flat}} &= \frac{1}{|F|}\sum_{(z,y,x)\in F}\left| \hat{V}_{z,y,x} - V_{z,y,x}\right|.
+\end{align}
+
+\textbf{Speed and memory.}
+We report encoding time, decoding time, and peak GPU memory.
+Decoding time is measured as the time to reconstruct the full volume at native resolution.
+
+\textcolor{red}{[OPTIONAL: If you compute morphological metrics (skeleton F1 / connectivity), add here.]}
+
+% ------------------------------
+\subsection{Training and Implementation Details}
+\label{sec:implementation}
+NeuroGS-Codec represents the volume as a sparse mixture of anisotropic 3D Gaussians with learnable means $\mu_i$, scales $s_i$, orientations $R_i$ (quaternion parameterization), and amplitudes $a_i$, plus a global bias $b$.
+We initialize Gaussians by sampling $\mu_i$ from the neurite map $M$ and set initial amplitude $a_i$ from voxel intensities.
+We train using Adam with learning rate schedule \textcolor{red}{[LR schedule]}, for \textcolor{red}{[number]} iterations and batch size \textcolor{red}{[B]}.
+
+\textbf{Sampling.}
+Each iteration samples a minibatch of coordinates consisting of uniform samples and neurite-biased samples proportional to $M$.
+We weight reconstruction errors using $w(\mathbf{x}) = 1 + \kappa M(\mathbf{x})$.
+
+\textbf{Densification and pruning.}
+We apply gradient-driven densification by splitting Gaussians with high position gradients and pruning primitives with low amplitude or excessive scale.
+We densify every \textcolor{red}{[N]} iterations from iteration \textcolor{red}{[start]} to \textcolor{red}{[end]} with maximum number of Gaussians \textcolor{red}{[$N_{\max}$]}.
+
+\textbf{Quantization and rate surrogate.}
+We use straight-through rounding for quantized parameters and a Laplace entropy model to estimate rate in bits.
+
+% ------------------------------
+\subsection{Main Results: Rate--Distortion and Fidelity}
+\label{sec:mainresults}
+We present rate--distortion curves comparing NeuroGS-Codec to baselines across multiple bpv operating points.
+Figure~\ref{fig:rd_curves} shows RD curves for PSNR and 3D SSIM.
+NeuroGS-Codec achieves \textcolor{red}{[state your main claim: e.g., higher PSNR at same bpv / lower bpv at same SSIM]} relative to \textcolor{red}{[best baseline]}.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=0.98\linewidth]{\textcolor{red}{PATH_TO_RD_CURVE_FIGURE}}
+  \caption{\textbf{Rate--distortion curves.} 
+  NeuroGS-Codec vs baselines on \textcolor{red}{[DATASET]}.
+  Left: PSNR vs bpv. Right: 3D SSIM vs bpv.
+  \textcolor{red}{[Add notes: whether rate is true compressed bytes or estimated entropy.]}}
+  \label{fig:rd_curves}
+\end{figure}
+
+\textbf{Qualitative comparisons.}
+Figure~\ref{fig:qual_mip} shows maximum intensity projections (MIPs) of ground truth, reconstructions, and absolute error maps.
+NeuroGS-Codec reconstructs thin neurite branches with high fidelity, while \textcolor{red}{[baseline]} exhibits \textcolor{red}{[blurring / ringing / discontinuities]}.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=0.98\linewidth]{\textcolor{red}{PATH_TO_QUALITATIVE_MIP_FIGURE}}
+  \caption{\textbf{Qualitative comparisons (MIP).} 
+  Ground truth, reconstruction, and absolute error MIP for \textcolor{red}{[DATASET/SAMPLE]} at \textcolor{red}{[bpv]}.
+  \textcolor{red}{[Optionally include multiple methods in rows.]}}
+  \label{fig:qual_mip}
+\end{figure}
+
+\textbf{Edge vs flat regions.}
+To assess geometry-critical regions, we compute error separately on high-gradient edges and flat background areas.
+Figure~\ref{fig:edge_flat} visualizes the gradient-based masks and the corresponding error maps.
+NeuroGS-Codec reduces edge-region errors by \textcolor{red}{[X\%]} compared to \textcolor{red}{[baseline]}, indicating improved boundary and filament preservation.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=0.98\linewidth]{\textcolor{red}{PATH_TO_EDGE_FLAT_FIGURE}}
+  \caption{\textbf{Edge-focused analysis.} 
+  Gradient magnitude MIP, edge mask (top \textcolor{red}{[10\%]}), flat mask, absolute error MIP, and error maps restricted to edge/flat regions.}
+  \label{fig:edge_flat}
+\end{figure}
+
+\textbf{Quantitative summary.}
+Table~\ref{tab:main_results} reports the best-performing operating points at matched bpv for all methods.
+NeuroGS-Codec consistently improves \textcolor{red}{[PSNR / SSIM / edge-MAE]} while maintaining \textcolor{red}{[decode time advantages / compact rate]}.
+
+\begin{table}[t]
+  \centering
+  \caption{\textbf{Main quantitative results on \textcolor{red}{[DATASET]}.}
+  Report bpv (or bpp), PSNR, 3D SSIM, mean slice SSIM, $\text{MAE}_{\text{edge}}$, $\text{MAE}_{\text{flat}}$, decoding time, and model size.}
+  \label{tab:main_results}
+  \resizebox{\linewidth}{!}{
+  \begin{tabular}{lcccccccc}
+    \toprule
+    Method & Rate (bpv) & PSNR$\uparrow$ & SSIM$_{3D}\uparrow$ & SSIM$_{\text{slice}}\uparrow$ & MAE$_{\text{edge}}\downarrow$ & MAE$_{\text{flat}}\downarrow$ & Decode (s)$\downarrow$ & Size (MB)$\downarrow$ \\
+    \midrule
+    TIFF-LZW & 4.00 & $\infty$ & 1.0 & \textcolor{red}{--} & \textcolor{red}{--} & \textcolor{red}{--} & 0.06 & 26.31 \\
+    TIFF-Deflate & 3.78 & $\infty$ & 1.0 & \textcolor{red}{--} & \textcolor{red}{--} & \textcolor{red}{--} & 0.08 & 24.84 \\
+    HDF5+gzip & 3.50 & $\infty$ & 1.0 & \textcolor{red}{--} & \textcolor{red}{--} & \textcolor{red}{--} & 0.37 & 22.99 \\
+    Zarr+Blosc-zstd & 4.28 & $\infty$ & 1.0 & \textcolor{red}{--} & \textcolor{red}{--} & \textcolor{red}{--} & 0.19 & 28.15 \\
+    JPEG2000 (slice) & 1.33 & 6.55 & 0.9757 & \textcolor{red}{--} & \textcolor{red}{--} & \textcolor{red}{--} & 3.92 & 8.76 \\
+    H.265 (video-slices) & \textcolor{red}{--} & \textcolor{red}{--} & \textcolor{red}{--} & \textcolor{red}{--} & \textcolor{red}{--} & \textcolor{red}{--} & \textcolor{red}{--} & \textcolor{red}{--} \\
+    SIREN-3D & \textcolor{red}{--} & \textcolor{red}{--} & \textcolor{red}{--} & \textcolor{red}{--} & \textcolor{red}{--} & \textcolor{red}{--} & \textcolor{red}{--} & \textcolor{red}{--} \\
+    PE-MLP & \textcolor{red}{--} & \textcolor{red}{--} & \textcolor{red}{--} & \textcolor{red}{--} & \textcolor{red}{--} & \textcolor{red}{--} & \textcolor{red}{--} & \textcolor{red}{--} \\
+    \midrule
+    NeuroGS-Codec (ours) & \textcolor{red}{--} & \textcolor{red}{--} & \textcolor{red}{--} & \textcolor{red}{--} & \textcolor{red}{--} & \textcolor{red}{--} & \textcolor{red}{--} & \textcolor{red}{--} \\
+    \bottomrule
+  \end{tabular}}
+\end{table}
+
+% ======================================================================
+% Ablations
+% ======================================================================
+\section{Ablation Studies}
+\label{sec:ablations}
+We perform ablations to isolate the contribution of each component in NeuroGS-Codec.
+Unless otherwise stated, all ablations use the same training iterations, sampling protocol, and evaluation settings as the full model.
+
+\subsection{Ablation Setup}
+\label{sec:ablation_setup}
+We evaluate ablations at a matched operating point of \textcolor{red}{[bpv]} or matched number of primitives $N=\textcolor{red}{[N]}$.
+We report PSNR, 3D SSIM, and edge-focused errors to quantify geometric fidelity.
+
+\subsection{Effect of Gaussian Parameterization}
+\label{sec:ablation_param}
+We compare anisotropic oriented Gaussians (full model) against isotropic Gaussians and/or Gaussians without learnable rotation:
+\begin{itemize}
+  \item \textbf{Isotropic (no anisotropy):} $s_{i,x}=s_{i,y}=s_{i,z}$.
+  \item \textbf{No rotation:} fix $R_i=I$.
+\end{itemize}
+This tests whether orientation-aware covariance is necessary for preserving neurite geometry and branching continuity.
+
+\subsection{Effect of Densification and Pruning}
+\label{sec:ablation_densify}
+We remove densification and train with a fixed number of primitives ($N=N_0$), and compare against gradient-driven densification.
+We additionally ablate pruning thresholds (\textcolor{red}{min amplitude}, \textcolor{red}{max scale}) to understand rate allocation and artifact formation.
+
+\subsection{Loss and Regularization Ablations}
+\label{sec:ablation_loss}
+We ablate each loss/regularization term:
+\begin{itemize}
+  \item \textbf{No overlap penalty ($\beta_{\text{overlap}}=0$):} tests whether separating Gaussians reduces redundancy and improves geometry.
+  \item \textbf{No edge-aware loss ($\beta_{\text{edge}}=0$):} tests boundary preservation.
+  \item \textbf{No SSIM term ($\beta_{\text{ssim}}=0$):} tests structural perceptual similarity.
+  \item \textbf{No TV term ($\beta_{\text{tv}}=0$):} tests piecewise smoothness of reconstructions.
+  \item \textbf{No topology proxy ($\alpha=0$):} tests whether patch topology regularization helps preserve branching structures.
+  \item \textbf{No parameter conditioning ($\beta_{\text{smooth}}=0$):} removes scale/anisotropy constraints on Gaussian covariances.
+\end{itemize}
+
+\textbf{Discussion.}
+We expect $\beta_{\text{edge}}$ and $\alpha$ to most strongly impact thin filament recovery, while $\beta_{\text{overlap}}$ improves rate allocation and reduces redundant primitives.
+Parameter conditioning stabilizes optimization and prevents degenerate Gaussians.
+
+\subsection{Ablation Results}
+\label{sec:ablation_results}
+Table~\ref{tab:ablations} summarizes quantitative results.
+Removing overlap regularization increases redundancy and slightly degrades \textcolor{red}{[edge MAE / SSIM]}, while removing edge-aware loss increases boundary errors (\textcolor{red}{[X\%]}).
+Disabling densification significantly reduces quality at thin branches, confirming the importance of adaptive primitive placement.
+
+\begin{table}[t]
+  \centering
+  \caption{\textbf{Ablations on \textcolor{red}{[DATASET/SAMPLE]}} at matched \textcolor{red}{[bpv or N]}.}
+  \label{tab:ablations}
+  \resizebox{\linewidth}{!}{
+  \begin{tabular}{lcccccc}
+    \toprule
+    Variant & Rate (bpv) & PSNR$\uparrow$ & SSIM$_{3D}\uparrow$ & MAE$_{\text{edge}}\downarrow$ & Decode (s)$\downarrow$ & \#Gaussians $N$ \\
+    \midrule
+    Full (ours) & \textcolor{red}{--} & \textcolor{red}{--} & \textcolor{red}{--} & \textcolor{red}{--} & \textcolor{red}{--} & \textcolor{red}{--} \\
+    \midrule
+    $-$ overlap ($\beta_{\text{overlap}}=0$) & \textcolor{red}{--} & \textcolor{red}{--} & \textcolor{red}{--} & \textcolor{red}{--} & \textcolor{red}{--} & \textcolor{red}{--} \\
+    $-$ edge ($\beta_{\text{edge}}=0$) & \textcolor{red}{--} & \textcolor{red}{--} & \textcolor{red}{--} & \textcolor{red}{--} & \textcolor{red}{--} & \textcolor{red}{--} \\
+    $-$ SSIM ($\beta_{\text{ssim}}=0$) & \textcolor{red}{--} & \textcolor{red}{--} & \textcolor{red}{--} & \textcolor{red}{--} & \textcolor{red}{--} & \textcolor{red}{--} \\
+    $-$ TV ($\beta_{\text{tv}}=0$) & \textcolor{red}{--} & \textcolor{red}{--} & \textcolor{red}{--} & \textcolor{red}{--} & \textcolor{red}{--} & \textcolor{red}{--} \\
+    $-$ topology ($\alpha=0$) & \textcolor{red}{--} & \textcolor{red}{--} & \textcolor{red}{--} & \textcolor{red}{--} & \textcolor{red}{--} & \textcolor{red}{--} \\
+    $-$ conditioning ($\beta_{\text{smooth}}=0$) & \textcolor{red}{--} & \textcolor{red}{--} & \textcolor{red}{--} & \textcolor{red}{--} & \textcolor{red}{--} & \textcolor{red}{--} \\
+    \midrule
+    Isotropic Gaussians & \textcolor{red}{--} & \textcolor{red}{--} & \textcolor{red}{--} & \textcolor{red}{--} & \textcolor{red}{--} & \textcolor{red}{--} \\
+    No rotation ($R_i=I$) & \textcolor{red}{--} & \textcolor{red}{--} & \textcolor{red}{--} & \textcolor{red}{--} & \textcolor{red}{--} & \textcolor{red}{--} \\
+    Fixed $N$ (no densify) & \textcolor{red}{--} & \textcolor{red}{--} & \textcolor{red}{--} & \textcolor{red}{--} & \textcolor{red}{--} & \textcolor{red}{--} \\
+    \bottomrule
+  \end{tabular}}
+\end{table}
+
+\subsection{Qualitative Ablations}
+\label{sec:qual_ablations}
+Figure~\ref{fig:ablation_vis} visualizes typical failure modes.
+Without edge-aware loss, reconstructions exhibit blurred neurite boundaries.
+Without overlap regularization, redundant Gaussians concentrate in high-intensity regions and produce \textcolor{red}{[artifacts / oversmoothing]}.
+Without densification, thin branches are frequently missed.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=0.98\linewidth]{\textcolor{red}{PATH_TO_ABLATION_VIS_FIGURE}}
+  \caption{\textbf{Qualitative ablations.}
+  MIPs of representative reconstructions (full vs ablated variants) and corresponding absolute error maps.}
+  \label{fig:ablation_vis}
+\end{figure}
+
+\subsection{Complexity Analysis}
+\label{sec:complexity}
+We report encoding/decoding time and memory footprint to quantify practical usability.
+NeuroGS-Codec provides \textcolor{red}{[fast decoding / interactive reconstruction]} compared to INR baselines that require evaluating an MLP at every voxel.
+Table~\ref{tab:complexity} summarizes runtime and memory.
+
+\begin{table}[t]
+  \centering
+  \caption{\textbf{Complexity comparison.} Encode/decode time and peak memory on \textcolor{red}{[GPU/CPU details]}.}
+  \label{tab:complexity}
+  \resizebox{\linewidth}{!}{
+  \begin{tabular}{lcccc}
+    \toprule
+    Method & Encode time (s)$\downarrow$ & Decode time (s)$\downarrow$ & Peak VRAM (GB)$\downarrow$ & Peak RAM (GB)$\downarrow$ \\
+    \midrule
+    JPEG2000 & \textcolor{red}{--} & \textcolor{red}{--} & \textcolor{red}{--} & \textcolor{red}{--} \\
+    H.265 & \textcolor{red}{--} & \textcolor{red}{--} & \textcolor{red}{--} & \textcolor{red}{--} \\
+    SIREN-3D & \textcolor{red}{--} & \textcolor{red}{--} & \textcolor{red}{--} & \textcolor{red}{--} \\
+    PE-MLP & \textcolor{red}{--} & \textcolor{red}{--} & \textcolor{red}{--} & \textcolor{red}{--} \\
+    \midrule
+    NeuroGS-Codec (ours) & \textcolor{red}{--} & \textcolor{red}{--} & \textcolor{red}{--} & \textcolor{red}{--} \\
+    \bottomrule
+  \end{tabular}}
+\end{table}
+
+\end{document}

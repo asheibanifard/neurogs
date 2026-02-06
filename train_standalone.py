@@ -63,57 +63,61 @@ BITSTREAM_PATH = "neurogs_codec_stream.npz.gz"
 
 # Training config and loss weights
 TRAINING_CONFIG = {
-    # Initial number of Gaussians
-    "N0": 5000,
+    # ---------------------------
+    # Initialization / steps
+    # ---------------------------
+    "N0": 8000,                 # higher start so we rely less on later massive splits
+    "steps": 35000,             # a bit longer, but you can early-stop
+    "batch": 4000,              # more points per step -> better gradient signal per iteration
 
-    # Optimization iterations
-    "steps": 30000,
+    # Distortion weighting on neurite map samples
+    "kappa": 10.0,              # stronger focus on neurites/edges
 
-    # How many points we sample per iteration from the target volume
-    # (half uniform, half neurite-biased).
-    "batch": 2000,
+    # ---------------------------
+    # Rate–distortion trade-off
+    # ---------------------------
+    "lam": 0.0015,              # slightly higher => discourages parameter bloat
+    "alpha": 0.01,              # topology proxy same
 
-    # Distortion weighting factor for neurite-biased samples:
-    # D = mean( (1 + kappa*m(x)) * rho(pred - tgt) )
-    "kappa": 8.0,
+    # ---------------------------
+    # Regularizers (rebalanced)
+    # ---------------------------
+    "beta_sparse": 0.006,       # stronger amplitude sparsity => more pruning + less redundant Gaussians
+    "beta_smooth": 0.0007,      # parameter conditioning slightly reduced (avoid over-smoothing shapes)
 
-    # Rate–distortion weights:
-    # total = D + lam*R + ...
-    "lam": 0.001,
+    "beta_tv": 0.001,           # reduce TV to avoid washing thin neurites
+    "beta_ssim": 0.06,          # moderate SSIM (too high can blur + cause spikes)
+    "beta_edge": 0.10,          # stronger edge emphasis to preserve thin boundaries
+    "beta_overlap": 0.02,       # more overlap penalty to prevent redundant clusters
+    "beta_grad": 0.0005,        # screenshot-like smoothness: small but helpful
 
-    # Topology regularizer weight
-    "alpha": 0.01,
+    # ---------------------------
+    # Optimizer schedule
+    # ---------------------------
+    "lr": 2e-3,                 # slightly lower start (stability)
+    "lr_final": 2e-4,           # lower final for refinement
 
-    # Gaussian parameter regularizers
-    "beta_sparse": 0.003,   # encourages small amplitudes -> fewer effective primitives
-    "beta_smooth": 0.001,   # "shape/covariance conditioning" (NOT field smoothness)
-
-    # Field-level / geometry regularizers
-    "beta_tv": 0.002,       # TV on predicted field patches (piecewise smoothness)
-    "beta_ssim": 0.1,       # local structural similarity (3D windowed)
-    "beta_edge": 0.05,      # emphasize edges / neurite boundaries
-    "beta_overlap": 0.01,   # discourage excessive primitive overlap
-    "beta_grad": 0.0,       # screenshot-like "smoothness": E ||∇f||^2 (turn on if needed)
-
-    # Learning rate schedule (linear decay)
-    "lr": 3e-3,
-    "lr_final": 5e-4,
-
-    # Densification settings:
-    # clone/split Gaussians based on accumulated |∇mu L| statistics
+    # ---------------------------
+    # Densification control (MOST IMPORTANT)
+    # ---------------------------
     "densify_enabled": True,
-    "densify_from_iter": 500,
-    "densify_until_iter": 20000,
-    "densify_every": 500,
-    "max_gaussians": 150000,
-    "min_amplitude": 0.0005,    # prune very small amplitude Gaussians
-    "grad_threshold": 0.00015,  # threshold for selecting points to clone/split
+    "densify_from_iter": 800,       # wait longer so early structure settles
+    "densify_until_iter": 12000,    # stop much earlier to avoid N explosion
+    "densify_every": 800,           # densify less frequently
 
-    # Patch size used by topology / TV / SSIM / edge losses
-    "topo_patch": (8, 16, 16),
+    "max_gaussians": 60000,         # hard cap for codec narrative (try 30k and 60k variants)
+    "min_amplitude": 0.0015,        # prune more aggressively
+    "grad_threshold": 0.00025,      # higher threshold => fewer splits/clones
 
-    # Save checkpoint every N iterations
+    # Patch sizes
+    "topo_patch": (8, 32, 32),      # larger XY patch improves SSIM/edge stability for thin neurites
+
+    # Checkpointing
     "save_every": 1000,
+    
+    # Performance optimizations
+    "use_amp": True,           # Mixed precision (FP16) for ~1.5-2x speedup
+    "use_compile": True,       # torch.compile() for ~1.3-2x speedup
 }
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -1211,6 +1215,52 @@ def train(model, V, coords_grid, M, H_mu, H_logs, H_q, H_a, H_b, Q, cfg):
     """
     controller = DensificationController(model, percent_dense=0.01) if cfg["densify_enabled"] else None
 
+    # ==================== Performance Optimizations ====================
+    # Mixed precision (AMP) for faster training
+    use_amp = cfg.get("use_amp", False) and torch.cuda.is_available()
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    
+    # torch.compile() for kernel fusion - note: disabled during densification iterations
+    # because model parameters change dynamically
+    use_compile = cfg.get("use_compile", False) and hasattr(torch, 'compile')
+    compiled_forward = None
+    if use_compile:
+        try:
+            # Compile a standalone forward function (more stable with dynamic N)
+            @torch.compile(mode="reduce-overhead")
+            def compiled_model_forward(mu, log_s, q, a, b, x):
+                """Compiled Gaussian mixture evaluation."""
+                s = torch.exp(log_s).clamp(1e-4, 10.0)
+                qn = q / (q.norm(dim=-1, keepdim=True) + 1e-8)
+                # quat_to_rotmat inline
+                w, qx, qy, qz = qn.unbind(-1)
+                ww, xx, yy, zz = w*w, qx*qx, qy*qy, qz*qz
+                wx, wy, wz = w*qx, w*qy, w*qz
+                xy, xz, yz = qx*qy, qx*qz, qy*qz
+                R = torch.stack([
+                    ww+xx-yy-zz, 2*(xy-wz), 2*(xz+wy),
+                    2*(xy+wz), ww-xx+yy-zz, 2*(yz-wx),
+                    2*(xz-wy), 2*(yz+wx), ww-xx-yy+zz
+                ], dim=-1).reshape(q.shape[0], 3, 3)
+                Rt = R.transpose(-1, -2)
+                
+                dx = x[:, None, :] - mu[None, :, :]
+                y = torch.einsum("pni,nij->pnj", dx, Rt)
+                y = y / (s[None, :, :] + 1e-8)
+                exp_term = -0.5 * (y * y).sum(dim=-1)
+                g = torch.exp(exp_term)
+                return (g * a[None, :]).sum(dim=1) + b
+            
+            compiled_forward = compiled_model_forward
+            print("[Optimization] torch.compile() enabled")
+        except Exception as e:
+            print(f"[Optimization] torch.compile() failed: {e}, falling back to eager mode")
+            use_compile = False
+    
+    if use_amp:
+        print("[Optimization] Mixed precision (AMP) enabled")
+    # ===================================================================
+
     # optimize both model params and entropy model params (Laplace scales)
     params = (
         list(model.parameters()) +
@@ -1236,6 +1286,8 @@ def train(model, V, coords_grid, M, H_mu, H_logs, H_q, H_a, H_b, Q, cfg):
     print(f"\n{'='*60}")
     print(f"Starting training: {steps} iterations")
     print(f"Device: {DEVICE}")
+    print(f"Mixed Precision (AMP): {use_amp}")
+    print(f"torch.compile(): {use_compile}")
     print(f"Initial Gaussians: {model.N}")
     print(f"{'='*60}\n")
 
@@ -1255,92 +1307,98 @@ def train(model, V, coords_grid, M, H_mu, H_logs, H_q, H_a, H_b, Q, cfg):
         # ------------------------------------------------------------
         # 2) Distortion term D (weighted robust error)
         # ------------------------------------------------------------
-        pred = model(pts)
-        w = 1.0 + cfg["kappa"] * mval
-        D = (w * charbonnier(pred - tgt)).mean()
+        with torch.cuda.amp.autocast(enabled=use_amp):
+            # Use compiled forward if available and model size is stable
+            if use_compile and compiled_forward is not None:
+                pred = compiled_forward(model.mu, model.log_s, model.q, model.a, model.b, pts)
+            else:
+                pred = model(pts)
+            w = 1.0 + cfg["kappa"] * mval
+            D = (w * charbonnier(pred - tgt)).mean()
 
-        # ------------------------------------------------------------
-        # 3) Rate term R (entropy proxy after quantization)
-        # ------------------------------------------------------------
-        # Quantize with STE: round(x/step)
-        mu_q = ste_round(model.mu / Q.mu)
-        logs_q = ste_round(model.log_s / Q.log_s)
-        q_q = ste_round(model.q / Q.q)
-        a_q = ste_round(model.a / Q.a)
-        b_q = ste_round(model.b / Q.b)
+            # ------------------------------------------------------------
+            # 3) Rate term R (entropy proxy after quantization)
+            # ------------------------------------------------------------
+            # Quantize with STE: round(x/step)
+            mu_q = ste_round(model.mu / Q.mu)
+            logs_q = ste_round(model.log_s / Q.log_s)
+            q_q = ste_round(model.q / Q.q)
+            a_q = ste_round(model.a / Q.a)
+            b_q = ste_round(model.b / Q.b)
 
-        # Each parameter block contributes bits under its Laplace model
-        R = (
-            H_mu.nll_bits(mu_q) +
-            H_logs.nll_bits(logs_q) +
-            H_q.nll_bits(q_q) +
-            H_a.nll_bits(a_q) +
-            H_b.nll_bits(b_q)
-        )
+            # Each parameter block contributes bits under its Laplace model
+            R = (
+                H_mu.nll_bits(mu_q) +
+                H_logs.nll_bits(logs_q) +
+                H_q.nll_bits(q_q) +
+                H_a.nll_bits(a_q) +
+                H_b.nll_bits(b_q)
+            )
 
-        # ------------------------------------------------------------
-        # 4) Patch-based regularizers (computed periodically)
-        # ------------------------------------------------------------
-        T = torch.tensor(0.0, device=V.device)
-        if (it % 20) == 0:
-            T = patch_topology_loss(model, coords_grid, V, patch_zyx=cfg["topo_patch"])
-            last_T = float(T.detach().cpu())
+            # ------------------------------------------------------------
+            # 4) Patch-based regularizers (computed periodically)
+            # ------------------------------------------------------------
+            T = torch.tensor(0.0, device=V.device)
+            if (it % 20) == 0:
+                T = patch_topology_loss(model, coords_grid, V, patch_zyx=cfg["topo_patch"])
+                last_T = float(T.detach().cpu())
 
-        TV = torch.tensor(0.0, device=V.device)
-        if cfg["beta_tv"] > 0 and (it % 10) == 0:
-            TV = reconstruction_tv_loss(model, coords_grid, patch_zyx=cfg["topo_patch"])
+            TV = torch.tensor(0.0, device=V.device)
+            if cfg["beta_tv"] > 0 and (it % 10) == 0:
+                TV = reconstruction_tv_loss(model, coords_grid, patch_zyx=cfg["topo_patch"])
 
-        SSIM_loss = torch.tensor(0.0, device=V.device)
-        if cfg["beta_ssim"] > 0 and (it % 5) == 0:
-            SSIM_loss = patch_ssim_loss(model, coords_grid, V, patch_zyx=cfg["topo_patch"])
-            last_SSIM = float(SSIM_loss.detach().cpu())
+            SSIM_loss = torch.tensor(0.0, device=V.device)
+            if cfg["beta_ssim"] > 0 and (it % 5) == 0:
+                SSIM_loss = patch_ssim_loss(model, coords_grid, V, patch_zyx=cfg["topo_patch"])
+                last_SSIM = float(SSIM_loss.detach().cpu())
 
-        Edge_loss = torch.tensor(0.0, device=V.device)
-        if cfg["beta_edge"] > 0 and (it % 5) == 0:
-            Edge_loss = edge_aware_loss(model, coords_grid, V, M, patch_zyx=cfg["topo_patch"])
+            Edge_loss = torch.tensor(0.0, device=V.device)
+            if cfg["beta_edge"] > 0 and (it % 5) == 0:
+                Edge_loss = edge_aware_loss(model, coords_grid, V, M, patch_zyx=cfg["topo_patch"])
 
-        # ------------------------------------------------------------
-        # 5) Smoothness terms (two different meanings!)
-        # ------------------------------------------------------------
-        # G: spatial/field smoothness (screenshot-like): E||∇f||^2
-        G = torch.tensor(0.0, device=V.device)
-        if cfg.get("beta_grad", 0.0) > 0 and (it % 10) == 0:
-            G = field_grad_smoothness(model, pts, n_sub=512)
+            # ------------------------------------------------------------
+            # 5) Smoothness terms (two different meanings!)
+            # ------------------------------------------------------------
+            # G: spatial/field smoothness (screenshot-like): E||∇f||^2
+            G = torch.tensor(0.0, device=V.device)
+            if cfg.get("beta_grad", 0.0) > 0 and (it % 10) == 0:
+                G = field_grad_smoothness(model, pts, n_sub=512)
 
-        # Sm: Gaussian *parameter* conditioning (covariance/shape regularizer)
-        Sm = smoothness_loss(model)
+            # Sm: Gaussian *parameter* conditioning (covariance/shape regularizer)
+            Sm = smoothness_loss(model)
 
-        # ------------------------------------------------------------
-        # 6) Sparsity + overlap
-        # ------------------------------------------------------------
-        S = sparsity_loss(model)
-        O = overlap_loss_mahalanobis(model, n_pairs=2048)
+            # ------------------------------------------------------------
+            # 6) Sparsity + overlap
+            # ------------------------------------------------------------
+            S = sparsity_loss(model)
+            O = overlap_loss_mahalanobis(model, n_pairs=2048)
 
-        # ------------------------------------------------------------
-        # 7) Full objective
-        # ------------------------------------------------------------
-        total = (
-            D +
-            cfg["lam"] * R +
-            cfg["alpha"] * T +
-            cfg["beta_tv"] * TV +
-            cfg["beta_ssim"] * SSIM_loss +
-            cfg["beta_edge"] * Edge_loss +
-            cfg.get("beta_grad", 0.0) * G +
-            cfg["beta_sparse"] * S +
-            cfg["beta_smooth"] * Sm +
-            cfg["beta_overlap"] * O
-        )
+            # ------------------------------------------------------------
+            # 7) Full objective
+            # ------------------------------------------------------------
+            total = (
+                D +
+                cfg["lam"] * R +
+                cfg["alpha"] * T +
+                cfg["beta_tv"] * TV +
+                cfg["beta_ssim"] * SSIM_loss +
+                cfg["beta_edge"] * Edge_loss +
+                cfg.get("beta_grad", 0.0) * G +
+                cfg["beta_sparse"] * S +
+                cfg["beta_smooth"] * Sm +
+                cfg["beta_overlap"] * O
+            )
 
-        # Backprop
+        # Backprop with AMP scaler
         opt.zero_grad(set_to_none=True)
-        total.backward()
+        scaler.scale(total).backward()
 
         # Accumulate densification stats from mu gradients
         if cfg["densify_enabled"] and controller is not None and model.mu.grad is not None:
             controller.add_densification_stats(model.mu.grad)
 
-        opt.step()
+        scaler.step(opt)
+        scaler.update()
 
         # ------------------------------------------------------------
         # 8) Logging
