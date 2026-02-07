@@ -156,7 +156,7 @@ def main():
                         help="Path to checkpoint file")
     parser.add_argument("--tif", type=str, default=None,
                         help="Path to ground truth TIFF (overrides checkpoint metadata)")
-    parser.add_argument("--output", type=str, default=None,
+    parser.add_argument("--output", type=str, default='xy_projection2.png',
                         help="Save figure to file instead of displaying")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
