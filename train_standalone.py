@@ -37,46 +37,44 @@ CKPT_PATH = os.path.join(CKPT_DIR, "neurogs_codec_ckpt_final.pt")
 TRAINING_CONFIG = {
     # init / steps
     "N0": 8000,
-    "steps": 35000,
-    "batch": 4000,
-    "kappa": 10.0,
+    "steps": 50000,           # INCREASED (was 35000)
+    "batch": 4000,            # REDUCED to avoid OOM (was 8000)
+    "kappa": 15.0,            # INCREASED (was 10.0)
 
     # rate-distortion
-    "lam": 0.0005,
-    "alpha": 0.01,
+    "lam": 0.0003,            # REDUCED (was 0.0005)
+    "alpha": 0.02,            # INCREASED (was 0.01)
 
-    # regularizers
-    "beta_sparse": 5e-4,
-    "beta_smooth": 7e-4,
-    "beta_tv": 1e-3,
-    "beta_ssim": 0.06,
-    "beta_edge": 0.10,
-    "beta_overlap": 0.02,
-    "beta_grad": 5e-4,
+    # regularizers - ALL REDUCED
+    "beta_sparse": 1e-4,      # was 5e-4
+    "beta_smooth": 1e-4,      # was 7e-4
+    "beta_tv": 5e-4,          # was 1e-3
+    "beta_ssim": 0.06,        # keep
+    "beta_edge": 0.10,        # keep
+    "beta_overlap": 0.005,    # was 0.02
+    "beta_grad": 5e-4,        # keep
 
     # optimizer schedule
     "lr": 2e-3,
     "lr_final": 2e-4,
 
-    # densification
+    # densification - MORE AGGRESSIVE
     "densify_enabled": True,
     "densify_from_iter": 1200,
-    "densify_until_iter": 12000,
+    "densify_until_iter": 18000,  # was 12000
     "densify_every": 1000,
-    "max_gaussians": 60000,
-    "grad_threshold": 2.5e-4,
+    "max_gaussians": 80000,       # REDUCED to avoid OOM (was 80000)
+    "grad_threshold": 1.5e-4,     # was 2.5e-4
 
-    # pruning (FIXED)
-    "min_gaussians": 256,            # HARD FLOOR
-    "prune_warmup_iters": 3000,      # no pruning before this
-    "prune_every": 2000,             # prune less frequently than densify
-    "max_prune_fraction": 0.15,      # never prune >15% per iteration
-    
-    # pruning thresholds
-    "min_contrib": 5e-9,             # MUCH LOWER (was 1e-6)
+    # pruning - same as before
+    "min_gaussians": 256,
+    "prune_warmup_iters": 3000,
+    "prune_every": 2000,
+    "max_prune_fraction": 0.15,
+    "min_contrib": 5e-9,
     "use_contrib_prune": True,
-    "prune_percentile": 0.05,        # prune worst 5% by contribution
-    "min_amplitude": 1.5e-4,         # fallback if use_contrib_prune=False
+    "prune_percentile": 0.05,
+    "min_amplitude": 1.5e-4,
     
     # patch sizes
     "topo_patch": (8, 32, 32),
@@ -86,9 +84,8 @@ TRAINING_CONFIG = {
 
     # perf
     "use_amp": True,
-    "use_compile": True,             # forced OFF if densify_enabled
+    "use_compile": True,
 }
-
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 torch.set_float32_matmul_precision("high")
 
@@ -248,13 +245,25 @@ class LaplaceEntropyModel(nn.Module):
         super().__init__()
         self.log_b = nn.Parameter(torch.tensor(math.log(init_scale), device=DEVICE))
 
-    def nll_bits(self, xq: torch.Tensor) -> torch.Tensor:
+    def bits_per_element(self, xq: torch.Tensor) -> torch.Tensor:
+        """Returns average bits per element (for loss computation)."""
         if xq.numel() == 0:
             return torch.zeros((), device=xq.device, dtype=xq.dtype)
-
         b = torch.exp(self.log_b).clamp(1e-6, 1e3)
         logp = -math.log(2.0) - torch.log(b) - (xq.abs() / b)
         return (-logp / math.log(2.0)).mean()
+
+    def total_bits(self, xq: torch.Tensor) -> torch.Tensor:
+        """Returns total bits for entire tensor."""
+        if xq.numel() == 0:
+            return torch.zeros((), device=xq.device, dtype=xq.dtype)
+        b = torch.exp(self.log_b).clamp(1e-6, 1e3)
+        logp = -math.log(2.0) - torch.log(b) - (xq.abs() / b)
+        return (-logp / math.log(2.0)).sum()
+
+    def nll_bits(self, xq: torch.Tensor) -> torch.Tensor:
+        """Backward compatible - returns mean bits."""
+        return self.bits_per_element(xq)
 
 def ste_round(x: torch.Tensor) -> torch.Tensor:
     return (x.round() - x).detach() + x
@@ -828,7 +837,8 @@ def train(model, V, coords_grid, M, H_mu, H_logs, H_q, H_a, H_b, Q, cfg):
     )
     opt = torch.optim.Adam(params, lr=cfg["lr"])
 
-    losses = {"D": [], "R": [], "T": [], "TV": [], "SSIM": [], "Edge": [], "G": [],
+    losses = {"D": [], "R": [], "R_total_bits": [], "R_bits_per_gaussian": [],
+              "T": [], "TV": [], "SSIM": [], "Edge": [], "G": [],
               "S": [], "Sm": [], "O": [], "Total": [], "N": []}
     densify_log = []
     t0 = time.time()
@@ -867,8 +877,13 @@ def train(model, V, coords_grid, M, H_mu, H_logs, H_q, H_a, H_b, Q, cfg):
             a_q = ste_round(model.a / Q.a) if model.N > 0 else model.a
             b_q = ste_round(model.b / Q.b)
 
-            R = (H_mu.nll_bits(mu_q) + H_logs.nll_bits(logs_q) + H_q.nll_bits(q_q) +
-                 H_a.nll_bits(a_q) + H_b.nll_bits(b_q))
+            # R for loss: average bits per element (keeps loss scale stable)
+            R = (H_mu.bits_per_element(mu_q) + H_logs.bits_per_element(logs_q) + 
+                 H_q.bits_per_element(q_q) + H_a.bits_per_element(a_q) + H_b.bits_per_element(b_q))
+            
+            # Total bits for logging (actual compressed size)
+            R_total = (H_mu.total_bits(mu_q) + H_logs.total_bits(logs_q) + 
+                       H_q.total_bits(q_q) + H_a.total_bits(a_q) + H_b.total_bits(b_q))
 
             T = torch.zeros((), device=V.device)
             if (it % 20) == 0:
@@ -921,6 +936,10 @@ def train(model, V, coords_grid, M, H_mu, H_logs, H_q, H_a, H_b, Q, cfg):
         # logging
         losses["D"].append(float(D.detach().cpu()))
         losses["R"].append(float(R.detach().cpu()))
+        total_bits = float(R_total.detach().cpu())
+        losses["R_total_bits"].append(total_bits)
+        bits_per_g = total_bits / max(model.N, 1)
+        losses["R_bits_per_gaussian"].append(bits_per_g)
         losses["T"].append(float(T.detach().cpu()))
         losses["G"].append(float(G.detach().cpu()))
         losses["TV"].append(float(TV.detach().cpu()))
@@ -977,10 +996,12 @@ def train(model, V, coords_grid, M, H_mu, H_logs, H_q, H_a, H_b, Q, cfg):
             dt = time.time() - t0
             recent = sum(losses["Total"][-200:]) / min(200, len(losses["Total"]))
             avg = sum(losses["Total"]) / len(losses["Total"])
+            total_kb = losses["R_total_bits"][-1] / 8 / 1024
+            bpg = losses["R_bits_per_gaussian"][-1]
             print(f"iter {it+1:5d} | D={losses['D'][-1]:.5f} R={losses['R'][-1]:.2f} "
                   f"T={last_T:.4f} SSIM={last_SSIM:.4f} | "
-                  f"Loss cur={losses['Total'][-1]:.4f} avg={avg:.4f} recent={recent:.4f} | "
-                  f"N={model.N} | {dt:.1f}s")
+                  f"Loss={losses['Total'][-1]:.4f} | "
+                  f"N={model.N} | {total_kb:.1f}KB ({bpg:.1f} bits/G) | {dt:.1f}s")
 
         if cfg.get("save_every") and (it + 1) % cfg["save_every"] == 0:
             save_checkpoint(
