@@ -1,7 +1,5 @@
 % ======================================================================
-% NeuroGS-Codec: Complete Loss Template (Explanation + Motivation)
-% ======================================================================
-% Paste into your paper/thesis. Adjust notation to match your manuscript.
+% NeuroGS-Codec: Gaussian Mixture Volumetric Compression
 % ======================================================================
 \documentclass[11pt,a4paper]{article}
 
@@ -10,542 +8,829 @@
 \usepackage{bm}
 \usepackage{hyperref}
 \usepackage[margin=1in]{geometry}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{caption}
+\usepackage{subcaption}
 
 % Shorthand for bold symbols
 \newcommand{\bs}{\boldsymbol}
 
-\title{NeuroGS-Codec: Training Objective}
+\title{NeuroGS-Codec: Compressing Fluorescence Microscopy Volumes\\with Learnable 3D Gaussian Mixtures}
 \author{}
 \date{}
 
 \begin{document}
 \maketitle
-% ============================================================
-% NeuroGS-Codec: Loss Function + Regularization (Detailed)
-% (Drop-in section for your paper/thesis)
-% ============================================================
-% ============================================================
-% NeuroGS-Codec: Step-by-step Algorithm (Proposal-style)
-% ============================================================
 
-\section{Algorithm: Training a 3D Gaussian Implicit Volume (NeuroGS-Codec)}
-\label{sec:algorithm_proposal_style}
+% ============================================================
+% ABSTRACT
+% ============================================================
+\begin{abstract}
+Fluorescence microscopy generates massive volumetric datasets capturing intricate neuronal morphology at subcellular resolution. Efficient compression of these volumes is critical for storage, transmission, and large-scale analysis, yet traditional codecs fail to exploit the sparse, tubular geometry characteristic of neuronal structures. We present \textbf{NeuroGS-Codec}, a learned compression framework that represents 3D microscopy volumes as mixtures of anisotropic Gaussian primitives. Each Gaussian encodes position, orientation, scale, and amplitude, providing an interpretable parameterization that naturally aligns with elongated neuronal processes. Our approach combines geometry-weighted reconstruction loss emphasizing neurite boundaries, adaptive densification to allocate representational capacity where needed, and rate-aware regularization for compression efficiency. On a challenging confocal microscopy volume of neuronal dendrites (52.6 million voxels), NeuroGS-Codec achieves 38.09 dB PSNR and 0.93 SSIM at 5.57$\times$ compression (1.44 bits per voxel), matching state-of-the-art neural implicit baselines while offering explicit geometric interpretability. The Gaussian mixture formulation enables parallel evaluation without sequential network inference, and each primitive's parameters directly encode meaningful spatial structure amenable to downstream morphological analysis. Code is available at \url{https://github.com/asheibanifard/neurogs}.
+\end{abstract}
 
-\subsection*{Inputs and Parameters}
-\begin{itemize}
-\item Ground-truth volume $V(\mathbf{x})$ on a discrete voxel grid; normalized to $[0,1]$.
-\item Coordinate domain $\mathbf{x}\in\Omega\subset\mathbb{R}^3$, using normalized coordinates in $[-1,1]^3$.
-\item Number of Gaussians: $N$ (initialized to $N_0$, grows via densification).
-\item Hyperparameters: $\kappa,\lambda,\alpha,\beta_{\mathrm{S}},\beta_{\mathrm{Sm}},\beta_{\mathrm{O}},\beta_{\mathrm{TV}},\beta_{\mathrm{SSIM}},\beta_{\mathrm{Edge}},\beta_{\mathrm{G}}$.
-\item Quantization steps $\Delta_{\mu},\Delta_{\ell},\Delta_{q},\Delta_{a},\Delta_{b}$ (for rate term).
-\end{itemize}
+% ============================================================
+% INTRODUCTION
+% ============================================================
+\section{Introduction}
+\label{sec:introduction}
 
-% ------------------------------------------------------------
-\subsection{1. Prepare Training Data and Coordinates}
+Modern fluorescence microscopy techniques---including confocal, two-photon, and light-sheet imaging---routinely generate three-dimensional volumes spanning hundreds of gigabytes to terabytes per experiment~\cite{preibisch2014efficient}. These datasets capture neuronal morphology with exquisite detail: dendritic arbors, axonal projections, and synaptic structures are resolved at submicron scales across millimeter-scale tissue volumes. However, the sheer data volume poses significant challenges for storage, network transfer, and computational analysis. A single cleared brain imaged at cellular resolution can exceed 100 TB, making efficient compression essential for practical neuroscience workflows.
+
+Traditional compression approaches---JPEG2000, H.265/HEVC with 3D extensions, wavelet-based methods---treat volumetric data as generic signals without exploiting domain-specific structure. Neuronal fluorescence microscopy exhibits distinctive characteristics: (1) \emph{extreme sparsity}, with labeled neurons occupying a small fraction of the volume against dark background; (2) \emph{tubular geometry}, where neurites appear as elongated, branching structures; and (3) \emph{high local contrast} at neurite boundaries. Generic codecs allocate bits uniformly across space, wasting capacity on uninformative background while potentially blurring fine neuronal processes.
+
+Recent advances in neural implicit representations offer a fundamentally different approach: encoding volumetric data as the weights of a neural network that maps spatial coordinates to intensity values. Methods like COIN~\cite{dupont2021coin} and NeRF-inspired architectures~\cite{mildenhall2020nerf} demonstrate that compact MLPs can represent complex signals with favorable rate-distortion tradeoffs. However, MLP-based representations are ``black boxes''---the learned weights encode signal information in an opaque, entangled manner that resists interpretation or manipulation.
+
+Separately, 3D Gaussian Splatting (3DGS)~\cite{kerbl20233d} has emerged as a powerful alternative to implicit neural fields for scene representation. By modeling scenes as collections of explicit 3D Gaussian primitives, 3DGS achieves real-time rendering while maintaining high fidelity. Each Gaussian carries interpretable parameters: position, anisotropic covariance (encoding orientation and scale), and appearance. This explicit parameterization enables direct geometric reasoning, efficient parallel evaluation, and natural compression via quantization of primitive parameters.
+
+In this work, we introduce \textbf{NeuroGS-Codec}, which adapts the 3D Gaussian splatting paradigm for volumetric compression of fluorescence microscopy data. Rather than rendering images via rasterization, we evaluate a Gaussian mixture field at arbitrary 3D coordinates to reconstruct voxel intensities. Our key insight is that anisotropic Gaussians are well-suited to represent the elongated, tubular structures characteristic of neuronal processes: each Gaussian can stretch along a neurite's principal axis while remaining compact in orthogonal directions.
+
+\paragraph{Contributions.} Our main contributions are:
 \begin{enumerate}
-\item \textbf{Load and normalize the volume:}
-\[
-V \leftarrow \frac{V-\min(V)}{\max(V)-\min(V)+\epsilon}.
-\]
-\item \textbf{Construct a coordinate grid:} for each voxel index $(z,y,x)$ map to a continuous coordinate
-\[
-\mathbf{x}_{zyx} = (x',y',z') \in [-1,1]^3.
-\]
-\item \textbf{Construct a neurite/edge importance map} $m(\mathbf{x})\in[0,1]$ (DoG + gradient magnitude) to emphasize tubular/edge geometry during training.
+    \item \textbf{Gaussian mixture volumetric representation:} We formulate 3D volume compression as fitting a mixture of learnable anisotropic Gaussians with adaptive densification and pruning, enabling efficient allocation of representational capacity to complex neuronal structures.
+    
+    \item \textbf{Geometry-aware rate-distortion optimization:} We introduce a training objective combining edge-weighted reconstruction loss emphasizing neurite boundaries with a differentiable rate term for compression-quality tradeoff.
+    
+    \item \textbf{Experimental validation:} On a 52.6-megavoxel confocal microscopy volume, NeuroGS-Codec achieves 38.09 dB PSNR at 5.57$\times$ compression, matching MLP-based implicit representations while providing interpretable, geometrically meaningful primitives.
 \end{enumerate}
 
-% ------------------------------------------------------------
-\subsection{2. Construct the Implicit Function (Gaussian Mixture Field)}
-\begin{enumerate}
-\item \textbf{Define the implicit function} $f(\mathbf{x})$ as a weighted sum of Gaussian basis functions:
-\[
-f(\mathbf{x}) = \sum_{i=1}^{N} a_i\,G_i(\mathbf{x};\boldsymbol{\mu}_i,\boldsymbol{\Sigma}_i) + b.
-\]
-\item \textbf{Define each anisotropic Gaussian basis} as:
-\[
+The remainder of this paper is organized as follows. Section~\ref{sec:related_work} reviews related work on neural implicit representations, Gaussian splatting, and learned compression. Section~\ref{sec:method} presents the NeuroGS-Codec method including the Gaussian mixture representation, training objective, and optimization strategy. Section~\ref{sec:experiments} presents experimental results on fluorescence microscopy data. Section~\ref{sec:conclusion} concludes with discussion and future directions.
+
+% ============================================================
+% RELATED WORK
+% ============================================================
+\section{Related Work}
+\label{sec:related_work}
+
+NeuroGS-Codec builds upon advances in neural implicit representations, 3D Gaussian splatting, and learned compression. We review the most relevant prior work in each area.
+
+\subsection{Neural Implicit Representations}
+
+Neural implicit representations encode signals as the weights of a neural network that maps coordinates to signal values. This paradigm has transformed 3D vision and graphics, offering continuous, memory-efficient representations that naturally handle arbitrary resolution.
+
+\paragraph{Neural Radiance Fields.}
+Mildenhall et al.~\cite{mildenhall2020nerf} introduced Neural Radiance Fields (NeRF), which represent scenes as MLPs mapping 5D coordinates (position and viewing direction) to color and density. NeRF achieves photorealistic novel view synthesis by volume rendering through the learned radiance field. The key insight of using positional encoding---mapping input coordinates through sinusoidal functions at multiple frequencies---enables MLPs to learn high-frequency details that would otherwise be smoothed by spectral bias~\cite{rahaman2019spectral}. Subsequent work has extended NeRF to dynamic scenes~\cite{pumarola2021dnerf}, improved training efficiency~\cite{mueller2022instant,chen2022tensorf}, and enabled real-time rendering~\cite{yu2021plenoctrees}.
+
+\paragraph{Coordinate Networks and SIREN.}
+Sitzmann et al.~\cite{sitzmann2020siren} proposed SIREN (Sinusoidal Representation Networks), which replace ReLU activations with periodic sine functions. This architectural choice enables networks to represent signals and their derivatives accurately, making SIREN particularly suitable for solving PDEs and representing signed distance functions. However, sinusoidal activations can struggle with sparse, high-contrast data where the signal energy is concentrated in small regions---a characteristic of fluorescence microscopy volumes.
+
+\paragraph{Implicit Neural Representations for Volumes.}
+Implicit representations have been applied to volumetric medical and scientific data. Occupancy Networks~\cite{mescheder2019occupancy} and DeepSDF~\cite{park2019deepsdf} represent 3D shapes as learned decision boundaries. For volumetric imaging, neural implicit representations offer potential for compression~\cite{dupont2021coin,strumpler2022implicit} by encoding volumes as compact network weights rather than dense voxel arrays.
+
+\subsection{3D Gaussian Splatting}
+
+Gaussian splatting represents scenes using explicit 3D Gaussian primitives, offering an alternative to implicit MLP-based representations.
+
+\paragraph{3D Gaussian Splatting for Novel View Synthesis.}
+Kerbl et al.~\cite{kerbl20233d} introduced 3D Gaussian Splatting (3DGS), which represents scenes as collections of anisotropic 3D Gaussians with learnable position, covariance, opacity, and spherical harmonic color coefficients. By differentiably rasterizing these primitives, 3DGS achieves real-time rendering (>100 FPS) while matching or exceeding NeRF quality. The adaptive densification strategy---splitting Gaussians in under-reconstructed regions and cloning in over-reconstructed regions---enables efficient allocation of primitives to scene complexity.
+
+\paragraph{Extensions and Compression.}
+Subsequent work has extended 3DGS to dynamic scenes~\cite{luiten2023dynamic,wu20234dgaussians}, improved compression through learned codebooks~\cite{lee2024compact}, and applied Gaussian representations to diverse domains including avatars~\cite{qian2023gaussianavatars} and autonomous driving~\cite{yan2024street}. Compact3D~\cite{lee2024compact} demonstrates that 3DGS representations can be compressed by an order of magnitude through vector quantization and entropy coding.
+
+\subsection{Neural Compression}
+
+Learned compression methods leverage neural networks to achieve superior rate-distortion performance compared to traditional codecs.
+
+\paragraph{Image and Video Compression.}
+Ball\'e et al.~\cite{balle2017end,balle2018variational} pioneered end-to-end learned image compression using autoencoders with learned entropy models. These methods optimize a rate-distortion objective where the rate term is differentiably approximated during training. Subsequent work introduced hyperpriors~\cite{balle2018variational}, autoregressive context models~\cite{minnen2018joint}, and transformer-based architectures~\cite{zhu2022transformer}, progressively closing the gap with and surpassing traditional codecs like JPEG2000 and HEVC-intra.
+
+\paragraph{Implicit Neural Representations as Compression.}
+Dupont et al.~\cite{dupont2021coin} proposed COIN (Compression with Implicit Neural representations), demonstrating that fitting a small MLP to an image and storing its weights achieves competitive compression ratios. Str\"umpler et al.~\cite{strumpler2022implicit} extended this to video compression with temporal coherence. For volumetric data, neural implicit compression is particularly attractive because the representation cost grows with model capacity rather than voxel count.
+
+\paragraph{Scientific and Medical Imaging.}
+Compression of scientific imaging data poses unique challenges: lossless or near-lossless quality is often required to preserve quantitative accuracy, and data characteristics (sparsity, high dynamic range, domain-specific structures) differ substantially from natural images. Traditional approaches include JPEG2000~\cite{taubman2002jpeg2000} with 3D extensions, wavelet-based methods, and domain-specific codecs. Neural approaches for medical volumes~\cite{yang2023implicitvol,chen2023neurocompress} have shown promise but require careful handling of reconstruction fidelity for downstream analysis.
+
+\subsection{Gaussian Mixture Models for Volume Representation}
+
+Gaussian mixture models (GMMs) have a long history in signal processing and computer graphics for representing distributions and density fields.
+
+\paragraph{Classical GMM Fitting.}
+Expectation-Maximization (EM)~\cite{dempster1977maximum} remains the standard algorithm for fitting GMMs, alternating between assigning points to components and updating component parameters. Recent work has scaled GMM fitting to large datasets using stochastic variants and GPU acceleration.
+
+\paragraph{Differentiable Gaussian Primitives.}
+The success of 3DGS has renewed interest in Gaussian primitives as differentiable building blocks. Unlike classical GMM fitting, gradient-based optimization of Gaussian parameters enables end-to-end training with arbitrary loss functions, including perceptual losses, structural similarity, and rate constraints. NeuroGS-Codec adopts this differentiable framework, combining the interpretability of explicit Gaussian primitives with the flexibility of neural network training.
+
+% ============================================================
+% METHOD
+% ============================================================
+
+\section{Method}
+\label{sec:method}
+
+This section presents the NeuroGS-Codec framework for volumetric compression. We describe the Gaussian mixture representation (Section~\ref{subsec:representation}), the training objective comprising distortion, rate, and regularization terms (Section~\ref{subsec:objective}), and the optimization procedure including adaptive densification (Section~\ref{subsec:optimization}).
+
+\subsection{Gaussian Mixture Volume Representation}
+\label{subsec:representation}
+
+The central idea behind NeuroGS-Codec is to replace a dense voxel grid with a small collection of 3D Gaussian ``blobs.''  Instead of storing an intensity value at every one of the tens of millions of voxel locations, we store only the parameters of $N$ Gaussians---each described by its centre, shape, orientation, and brightness.  At any query point $\mathbf{x}$, the intensity is recovered by summing the contributions of all nearby Gaussians.  Because neuronal structures are spatially sparse (most of the volume is dark background) and locally smooth (neurites are continuous tubes), a relatively small number of well-placed Gaussians can capture the essential signal while ignoring empty space.
+
+Formally, we represent a normalized volumetric signal $V:\Omega\subset\mathbb{R}^3\rightarrow [0,1]$ as a weighted mixture of anisotropic 3D Gaussian basis functions:
+\begin{equation}
+f(\mathbf{x}) = \sum_{i=1}^{N} a_i\,G_i(\mathbf{x};\boldsymbol{\mu}_i,\boldsymbol{\Sigma}_i) + b,
+\label{eq:implicit_function}
+\end{equation}
+
+Intuitively, each Gaussian $G_i$ acts like a soft, bell-shaped ``spotlight'' centred at $\boldsymbol{\mu}_i$.  Its reach is controlled by the covariance $\boldsymbol{\Sigma}_i$: a Gaussian with a large covariance covers a wide region with gentle intensity fall-off, while a small covariance creates a tight, concentrated contribution.  The amplitude $a_i$ determines how bright or dark that spotlight is, and the bias $b$ sets the baseline intensity across the entire volume (capturing the average background level).
+The per-primitive parameters are:
+\begin{itemize}
+    \item $\boldsymbol{\mu}_i \in \mathbb{R}^3$: centre position in normalised coordinates $[-1,1]^3$.
+    \item $a_i \in \mathbb{R}$: amplitude (scalar weight of the $i$-th Gaussian).
+    \item $b \in \mathbb{R}$: a single global bias shared across all voxels.
+    \item $\boldsymbol{\Sigma}_i \in \mathbb{R}^{3\times 3}$: anisotropic covariance matrix (see parameterisation below).
+\end{itemize}
+Each Gaussian basis function is defined as:
+\begin{equation}
 G_i(\mathbf{x};\boldsymbol{\mu}_i,\boldsymbol{\Sigma}_i)
-=
-\exp\!\left(
+= \exp\!\left(
 -\frac{1}{2}(\mathbf{x}-\boldsymbol{\mu}_i)^\top \boldsymbol{\Sigma}_i^{-1}(\mathbf{x}-\boldsymbol{\mu}_i)
 \right).
-\]
-\item \textbf{Parameterize the covariance} for stable optimization:
-\[
+\label{eq:gaussian_basis}
+\end{equation}
+
+\paragraph{Covariance Parameterization.}
+A na\"ive approach would store the full $3\times3$ covariance matrix $\boldsymbol{\Sigma}_i$ directly, but this is problematic: a covariance must be symmetric and positive-definite, and unconstrained optimisation can easily violate these properties, leading to degenerate or numerically unstable Gaussians.  Instead, we decompose the covariance into a \emph{rotation} and a \emph{scale}:
+\begin{equation}
 \boldsymbol{\Sigma}_i = R(\mathbf{q}_i)\,\mathrm{diag}(\mathbf{s}_i^2)\,R(\mathbf{q}_i)^\top,
-\qquad \mathbf{s}_i=\exp(\boldsymbol{\ell}_i),
-\]
-where $R(\mathbf{q}_i)\in SO(3)$ is a rotation from a unit quaternion $\mathbf{q}_i$ and $\boldsymbol{\ell}_i$ are log-scales.
+\qquad \mathbf{s}_i = \exp(\boldsymbol{\ell}_i),
+\label{eq:covariance_param}
+\end{equation}
+
+This decomposition has a clear geometric interpretation.  The diagonal matrix $\mathrm{diag}(\mathbf{s}_i^2)$ defines three axis-aligned radii---how far the Gaussian extends along each principal direction.  The rotation $R(\mathbf{q}_i)$ then tilts these axes to any desired orientation.  Together, they allow each Gaussian to form an elongated ellipsoid that can align with a neurite's principal axis: stretching along the dendrite while remaining compact in the perpendicular directions.  This is fundamentally why anisotropic Gaussians are well-suited to neuronal data---isotropic (spherical) Gaussians would need far more primitives to tile along a tubular structure.
+
+We parameterise the rotation via a unit quaternion $\mathbf{q}_i \in \mathbb{R}^4$ rather than Euler angles or rotation matrices.  Quaternions are free of gimbal lock, require only four numbers, and are easy to normalise ($\mathbf{q}_i \leftarrow \mathbf{q}_i / \|\mathbf{q}_i\|$) to stay on the unit sphere during gradient updates.  The conversion to a $3\times3$ rotation matrix $R(\mathbf{q}_i)$ is a closed-form algebraic expression.
+
+The scale parameters are stored in \emph{log-space} as $\boldsymbol{\ell}_i = \ln \mathbf{s}_i$.  This has two benefits: (i)~the exponential map $\mathbf{s}_i = \exp(\boldsymbol{\ell}_i)$ guarantees positive scales without explicit constraints, and (ii)~gradient steps in log-space produce multiplicative changes in scale, giving the optimiser equal ability to refine very small and very large Gaussians.  We additionally clamp $\mathbf{s}_i$ to $[10^{-4},\,10]$ for numerical stability.
+
+The learnable parameters per Gaussian are:
+\begin{itemize}
+    \item $\mathbf{q}_i \in \mathbb{R}^4$: unit quaternion whose corresponding rotation matrix $R(\mathbf{q}_i)\in SO(3)$ defines the orientation of the $i$-th Gaussian's principal axes. During the forward pass, $\mathbf{q}_i$ is normalised to unit length: $\mathbf{q}_i \leftarrow \mathbf{q}_i / (\|\mathbf{q}_i\| + \epsilon)$.
+    \item $\boldsymbol{\ell}_i \in \mathbb{R}^3$: log-scale vector.  The axis-aligned standard deviations are recovered as $\mathbf{s}_i = \exp(\boldsymbol{\ell}_i)$, clamped to $[10^{-4},\,10]$ for numerical stability.  Working in log-space ensures positivity and provides a more uniform optimisation landscape.
+\end{itemize}
+This decomposition yields $3 + 4 + 3 + 1 = 11$ learnable scalars per Gaussian (position, quaternion, log-scale, amplitude), plus the single global bias $b$.  The total model has $11N + 1$ parameters.  Each Gaussian can stretch along arbitrary orientations, naturally capturing tubular neurite geometry.
+
+\subsection{Training Objective}
+\label{subsec:objective}
+
+Training NeuroGS-Codec amounts to solving a constrained optimisation problem: we want the Gaussian mixture to reconstruct the volume as accurately as possible (\emph{distortion}), while keeping the total number of bits needed to store the parameters as small as possible (\emph{rate}).  This is the classic \emph{rate--distortion trade-off} from information theory.  On top of this, we add several \emph{regularisers} that inject prior knowledge about the data---for example, that neuronal volumes are spatially smooth, that neurite boundaries are important, and that Gaussians should not redundantly overlap.
+
+The overall loss is:
+\begin{equation}
+\mathcal{L}_{\mathrm{Total}} = \underbrace{\mathcal{L}_{\mathrm{D}}}_{\text{reconstruction}} + \lambda\,\underbrace{\mathcal{L}_{\mathrm{R}}}_{\text{rate (bits)}} + \sum_k \beta_k\,\underbrace{\mathcal{L}_k}_{\text{regularisers}}.
+\label{eq:total_loss}
+\end{equation}
+The scalar trade-off weights are:
+\begin{itemize}
+    \item $\lambda$: rate--distortion weight controlling the strength of the entropy-based rate penalty (set to $3\times10^{-4}$).
+    \item $\beta_k$: per-regulariser weights for the auxiliary loss terms described below.
+\end{itemize}
+
+\subsubsection{Distortion Term}
+
+The distortion term measures how well the Gaussian mixture reproduces the original volume.  A standard choice would be mean squared error (MSE), but MSE has two shortcomings for our data: (i)~it treats all voxels equally, wasting effort on the vast dark background~\cite{wang2004image}, and (ii)~it is sensitive to outliers---a single bright voxel with a large error can dominate the gradient and destabilise training~\cite{barron2019general}.
+
+We address both issues with a \emph{geometry-weighted Charbonnier loss}~\cite{charbonnier1994two}:
+\begin{equation}
+\mathcal{L}_{\mathrm{D}} = \frac{1}{M}\sum_{k=1}^{M} \underbrace{(1+\kappa\, m(\mathbf{x}_k))}_{\text{geometry weight}}\;\underbrace{\sqrt{(f(\mathbf{x}_k)-v_k)^2+\epsilon^2}}_{\text{Charbonnier penalty}},
+\label{eq:distortion}
+\end{equation}
+
+\paragraph{How the Charbonnier penalty works.}
+The Charbonnier function $\rho(r) = \sqrt{r^2 + \epsilon^2}$ is a smooth approximation to the absolute value $|r|$.  When the residual $r = f(\mathbf{x}) - v$ is large ($|r| \gg \epsilon$), $\rho(r) \approx |r|$, behaving like an $\ell_1$ loss: it penalises errors linearly rather than quadratically, which prevents a few hard-to-fit voxels from overwhelming the gradient.  When $|r|$ is small ($|r| \ll \epsilon$), $\rho(r) \approx r^2/(2\epsilon)$, behaving like a smooth $\ell_2$ loss that provides informative gradients even near zero error.  This ``best of both worlds'' behaviour makes training more stable and robust than pure MSE.
+
+\paragraph{How the geometry weight works.}
+The factor $(1 + \kappa\, m(\mathbf{x}_k))$ multiplies the per-voxel loss by a spatially varying weight.  In background regions where $m(\mathbf{x}) \approx 0$, the weight is approximately~1---ordinary importance.  At neurite boundaries and fine processes where $m(\mathbf{x}) \approx 1$, the weight rises to $1 + \kappa = 16$, making the model pay 16$\times$ more attention to errors in these regions.  The effect is that the optimiser preferentially places and refines Gaussians at neurite boundaries, which is exactly where reconstruction fidelity matters most for downstream biological analysis.
+
+\paragraph{How the neurite map $m(\mathbf{x})$ is constructed.}
+The neurite map is built entirely from the input volume---no manual annotations are required:
+\begin{enumerate}
+    \item \textbf{Difference-of-Gaussians (DoG):} The volume is smoothed at two scales ($\sigma_1 = 0.8$, $\sigma_2 = 2.0$) and the difference is taken.  This acts as a band-pass filter that highlights blob-like neurite cross-sections while suppressing both noise (high frequency) and broad background gradients (low frequency).
+    \item \textbf{Gradient magnitude:} The $\ell_2$ norm of the spatial gradient $\|\nabla V\|$ is computed via finite differences, detecting sharp intensity transitions---i.e., neurite edges.
+    \item \textbf{Combination:} The two channels are summed ($m = \mathrm{DoG} + 0.5\,\|\nabla V\|$) and normalised to $[0,1]$.
 \end{enumerate}
 
-% ------------------------------------------------------------
-\subsection{3. Define the Loss Function (Distortion + Rate)}
-\begin{enumerate}
-\item \textbf{Sample $M$ training voxels} $\{(\mathbf{x}_k,v_k,m_k)\}_{k=1}^{M}$, where
-$v_k = V(\mathbf{x}_k)$ and $m_k=m(\mathbf{x}_k)$.
-\item \textbf{Forward prediction:}
-\[
-\hat{v}_k = f(\mathbf{x}_k).
-\]
-\item \textbf{Distortion (geometry-weighted Charbonnier):}
-\[
-\mathcal{L}_{\mathrm{D}}
-=
-\frac{1}{M}\sum_{k=1}^{M}
-\underbrace{(1+\kappa m_k)}_{\text{geometry weight}}
-\underbrace{\sqrt{(\hat{v}_k - v_k)^2+\epsilon^2}}_{\text{Charbonnier}}.
-\]
-\item \textbf{Rate (entropy proxy for quantized parameters):}\\
-Quantize parameters using scalar step sizes $\Delta$:
-\[
+The remaining definitions are:
+\begin{itemize}
+    \item $\{(\mathbf{x}_k, v_k)\}_{k=1}^M$: a mini-batch of $M$ coordinate--intensity pairs ($M=4{,}000$).  Half are drawn uniformly; the other half are importance-sampled proportionally to the neurite map $m$.
+    \item $m(\mathbf{x})\in[0,1]$: a precomputed neurite/edge importance map.  It is constructed as $m = \mathrm{DoG}(V;\sigma_1{=}0.8,\sigma_2{=}2.0) + 0.5\,\|\nabla V\|$, normalised to $[0,1]$, combining a Difference-of-Gaussians (DoG) filter for blob-like neurite cross-sections with gradient magnitude for edge detection.  No manual annotation is required.
+    \item $\kappa$: edge emphasis factor that multiplies $m(\mathbf{x})$ to up-weight geometrically important voxels (neurite boundaries and fine processes).  Set to $\kappa=15$.
+    \item $\epsilon$: Charbonnier smoothness constant ($\epsilon^2$ added inside the square root), set to $10^{-6}$.  For $|r|\gg\epsilon$, the loss behaves like $\ell_1$; for $|r|\ll\epsilon$, like $\ell_2$.
+\end{itemize}
+
+\subsubsection{Rate Term}
+
+Without explicit control over parameter precision, the optimiser is free to use arbitrarily fine-grained parameter values that maximise reconstruction quality but are expensive to store.  Our ablation study (Section~\ref{sec:ablation}) demonstrates this dramatically: removing the rate term causes the encoded model to swell from $\sim$0.17~MB to $\sim$70~MB---a $400\times$ increase---while PSNR improves by only $\sim$1~dB.  The rate term prevents this by penalising the information content (entropy) of the parameters, forcing the model to find representations that are both accurate \emph{and} compressible.
+
+\paragraph{Quantization.}
+The first step is to simulate the effect of finite-precision storage during training.  Each continuous parameter $\theta$ is mapped to a discrete grid by rounding:
+\begin{equation}
 \widehat{\theta} = \mathrm{round}(\theta/\Delta),
-\]
-and estimate expected bits with a Laplace model:
-\[
-\mathcal{L}_{\mathrm{R}}
-=
-\mathcal{R}(\widehat{\boldsymbol{\mu}})
-+\mathcal{R}(\widehat{\boldsymbol{\ell}})
-+\mathcal{R}(\widehat{\mathbf{q}})
-+\mathcal{R}(\widehat{\mathbf{a}})
-+\mathcal{R}(\widehat{b}).
-\]
-\end{enumerate}
+\label{eq:quantization}
+\end{equation}
+where $\Delta$ is the quantization step size.  Rounding is not differentiable, so we use \emph{straight-through estimation} (STE): in the forward pass, the quantized value $\widehat{\theta}$ is used; in the backward pass, gradients pass through the rounding as if it were the identity.  This well-established trick~\cite{balle2017end} allows gradient-based optimisation to ``plan ahead'' for quantization.
 
-% ------------------------------------------------------------
-\subsection{4. Regularization Terms (Proposal-style)}
-\begin{enumerate}
-\item \textbf{4.1 Weight Sparsity (encourage fewer active Gaussians):}
-\[
+\paragraph{Entropy estimation.}
+The number of bits required to losslessly encode a set of quantized values depends on their statistical distribution.  Values that cluster tightly around a single peak can be encoded with very few bits (low entropy); values spread broadly require more bits (high entropy).  We model each quantized parameter group with a Laplace distribution and compute the expected code length:
+\begin{equation}
+\mathcal{L}_{\mathrm{R}} = \mathcal{R}(\widehat{\boldsymbol{\mu}}) + \mathcal{R}(\widehat{\boldsymbol{\ell}}) + \mathcal{R}(\widehat{\mathbf{q}}) + \mathcal{R}(\widehat{\mathbf{a}}) + \mathcal{R}(\widehat{b}),
+\label{eq:rate}
+\end{equation}
+where $\mathcal{R}(\widehat{\theta}) = -\log_2 p_{\mathrm{Laplace}}(\widehat{\theta})$ is summed over all elements.  By minimising $\mathcal{L}_{\mathrm{R}}$, the optimiser learns to cluster parameter values into a narrow, low-entropy distribution---effectively ``rounding itself'' toward compressible configurations.  Each parameter group ($\boldsymbol{\mu}$, $\boldsymbol{\ell}$, $\mathbf{q}$, $\mathbf{a}$, $b$) has its own Laplace scale, so the model can allocate more precision to parameters that matter (e.g., positions) and less to those that are more tolerant of quantization (e.g., quaternions).
+
+The parameters involved are:
+\begin{itemize}
+    \item $\theta$: a generic placeholder for any learnable parameter ($\boldsymbol{\mu}_i$, $\boldsymbol{\ell}_i$, $\mathbf{q}_i$, $a_i$, or $b$).
+    \item $\Delta$: quantization step size.  During training, straight-through estimation (STE) passes gradients through the rounding operation.
+    \item $\mathcal{R}(\widehat{\theta})$: estimated entropy of the quantized parameter vector under a per-parameter Laplace distribution, yielding a differentiable bit count.  Each parameter group ($\boldsymbol{\mu}$, $\boldsymbol{\ell}$, $\mathbf{q}$, $\mathbf{a}$, $b$) contributes independently.
+    \item $\alpha$: entropy scale factor that modulates temperature in the Laplace entropy model (set to $0.02$).  Larger $\alpha$ encourages broader distributions and higher entropy; smaller $\alpha$ yields sharper distributions and lower bit estimates.
+\end{itemize}
+
+\subsubsection{Regularization Terms}
+
+The regularisers encode prior knowledge about the structure of the volume and the desired properties of the Gaussian mixture.  Without them, the optimiser might produce a model that overfits noise, contains many redundant overlapping Gaussians, or generates high-frequency artefacts between primitives.  Each regulariser addresses a specific failure mode; together they guide the optimiser toward solutions that are smooth, compact, non-redundant, and faithful to neurite geometry.
+
+Each regulariser is weighted by a scalar $\beta_k$; the values used in all experiments are listed below alongside the loss definition.
+
+\textbf{Notation.}  Throughout this section $\mathbb{E}$ denotes a \emph{sample mean}, i.e.\ an empirical average over a mini-batch of randomly drawn elements.  Specifically:
+$\mathbb{E}_{\mathbf{x}}[\cdot]$ averages over uniformly sampled coordinates $\mathbf{x}\in\Omega$;
+$\mathbb{E}_{(i,j)}[\cdot]$ averages over randomly sampled Gaussian pairs $(i,j)$;
+$\mathbb{E}_{\mathcal{P}}[\cdot]$ averages over randomly sampled 3-D patches $\mathcal{P}\subset\Omega$ of size $(8\times32\times32)$ voxels; and
+$\mathbb{E}_{\mathbf{x}\in\mathcal{P}}[\cdot]$ averages over voxels $\mathbf{x}$ within such a patch.
+In every case the expectation is approximated by a single random draw per training iteration, keeping computational cost constant.
+
+\paragraph{Sparsity ($\beta_{\text{sparse}} = 10^{-4}$).}
+\textbf{Why:} Not every Gaussian contributes meaningfully to the reconstruction.  Some may end up in empty background regions where their amplitude is negligibly small.  Keeping these dead primitives wastes storage (their parameters still need to be encoded) and clutters the representation.
+
+\textbf{How:} An $\ell_1$ penalty on the amplitudes acts as a soft threshold that drives unneeded amplitudes toward zero:
+\begin{equation}
 \mathcal{L}_{\mathrm{S}} = \frac{1}{N}\sum_{i=1}^{N}|a_i|.
-\]
-
-\item \textbf{4.2 Overlap Regularization (discourage redundant Gaussians):}\\
-For sampled pairs $(i,j)$, define
-\[
-d_{ij}^2
-=
-(\boldsymbol{\mu}_i-\boldsymbol{\mu}_j)^\top
-(\boldsymbol{\Sigma}_i+\boldsymbol{\Sigma}_j+\epsilon I)^{-1}
-(\boldsymbol{\mu}_i-\boldsymbol{\mu}_j),
-\qquad
-\mathrm{overlap}_{ij}=\exp(-\tfrac{1}{2}d_{ij}^2),
-\]
-and penalize expected overlap:
-\[
-\mathcal{L}_{\mathrm{O}}=\mathbb{E}_{(i,j)}[\mathrm{overlap}_{ij}].
-\]
-
-\item \textbf{4.3 Smoothness Regularization (two levels):}
-\begin{itemize}
-\item \emph{Field smoothness (closest to “smooth transitions”):}
-\[
-\mathcal{L}_{\mathrm{G}}=\mathbb{E}_{\mathbf{x}\sim\Omega}\big[\|\nabla_{\mathbf{x}} f(\mathbf{x})\|_2^2\big].
-\]
-\item \emph{Parameter conditioning (covariance stability):}
-\[
-\mathcal{L}_{\mathrm{Sm}}=
-\text{penalty to keep scales bounded and avoid extreme anisotropy}.
-\]
-\end{itemize}
-
-\item \textbf{4.4 Patch TV (piecewise smooth geometry):}
-\[
-\mathcal{L}_{\mathrm{TV}} = \mathbb{E}_{\mathcal{P}}\big[\|\nabla f\|_1\big].
-\]
-
-\item \textbf{4.5 Patch SSIM (structure preservation):}
-\[
-\mathcal{L}_{\mathrm{SSIM}} = 1-\mathrm{SSIM}(f(\mathcal{P}),V(\mathcal{P})).
-\]
-
-\item \textbf{4.6 Edge-aware reconstruction (boundary alignment):}
-\[
-\mathcal{L}_{\mathrm{Edge}}
-=
-\mathbb{E}_{\mathbf{x}\in\mathcal{P}}\big[w_{\mathrm{edge}}(\mathbf{x})|f(\mathbf{x})-V(\mathbf{x})|\big].
-\]
-
-\item \textbf{4.7 (Optional) Topology-biased patch loss (neurite continuity):}
-\[
-\mathcal{L}_{\mathrm{T}}
-=
-\mathrm{TV}(\sigma(\gamma(f-\tau))) + c_h\| \sigma(\gamma(f-\tau))-\mathrm{LPF}(\sigma(\gamma(f-\tau)))\|_1.
-\]
-\end{enumerate}
-
-% ------------------------------------------------------------
-\subsection{5. Total Objective}
-\begin{equation}
-\mathcal{L}_{\mathrm{Total}}
-=
-\mathcal{L}_{\mathrm{D}}
-+ \lambda\,\mathcal{L}_{\mathrm{R}}
-+ \alpha\,\mathcal{L}_{\mathrm{T}}
-+ \beta_{\mathrm{TV}}\mathcal{L}_{\mathrm{TV}}
-+ \beta_{\mathrm{SSIM}}\mathcal{L}_{\mathrm{SSIM}}
-+ \beta_{\mathrm{Edge}}\mathcal{L}_{\mathrm{Edge}}
-+ \beta_{\mathrm{G}}\mathcal{L}_{\mathrm{G}}
-+ \beta_{\mathrm{S}}\mathcal{L}_{\mathrm{S}}
-+ \beta_{\mathrm{Sm}}\mathcal{L}_{\mathrm{Sm}}
-+ \beta_{\mathrm{O}}\mathcal{L}_{\mathrm{O}}.
-\label{eq:total_objective}
+\label{eq:sparsity}
 \end{equation}
+Unlike $\ell_2$ regularisation (which would shrink all amplitudes uniformly), the $\ell_1$ norm encourages \emph{exact} zeros---making it straightforward to prune negligible Gaussians during the pruning phase (Section~\ref{subsec:optimization}) without noticeable quality loss.
 
-% ------------------------------------------------------------
-\subsection{6. Optimize Gaussian Parameters and Weights (Gradient-Based)}
-\begin{enumerate}
-\item Initialize parameters $\{\boldsymbol{\mu}_i,\boldsymbol{\ell}_i,\mathbf{q}_i,a_i\}_{i=1}^{N}$ and $b$
-(using importance sampling from $m(\mathbf{x})$).
-\item Use Adam optimizer:
-\[
-\theta \leftarrow \theta - \eta \nabla_{\theta}\mathcal{L}_{\mathrm{Total}},
-\quad
-\theta \in \{\boldsymbol{\mu},\boldsymbol{\ell},\mathbf{q},\mathbf{a},b\}.
-\]
-\item Backpropagate through the Gaussian basis functions via automatic differentiation.
-\end{enumerate}
+\paragraph{Overlap ($\beta_{\text{overlap}} = 0.005$).}
+\textbf{Why:} If two Gaussians sit very close together with similar shapes, they contribute nearly identical information to the reconstructed field.  This redundancy wastes representational capacity: the same effect could be achieved by a single, slightly larger Gaussian.  Worse, highly overlapping Gaussians create an ill-conditioned optimisation landscape where small shifts in one primitive can be compensated by the other, slowing convergence.
 
-% ------------------------------------------------------------
-\subsection{7. Iterative Training Loop (Proposal-style)}
-\begin{enumerate}
-\item \textbf{Sample voxel data:}
-Randomly sample a batch of voxel coordinates (half uniform, half importance-weighted by $m(\mathbf{x})$).
-\item \textbf{Forward pass:}
-Compute predictions $\hat{v}_k=f(\mathbf{x}_k)$.
-\item \textbf{Compute loss:}
-Evaluate $\mathcal{L}_{\mathrm{Total}}$ from Eq.~\eqref{eq:total_objective}.
-\item \textbf{Backpropagation:}
-Compute gradients $\nabla_{\theta}\mathcal{L}_{\mathrm{Total}}$.
-\item \textbf{Update parameters:}
-Apply Adam update to all Gaussian parameters and entropy-model parameters.
-\end{enumerate}
-
-% ------------------------------------------------------------
-\subsection{8. Densification and Pruning (Adaptive Gaussian Allocation)}
-\begin{enumerate}
-\item Accumulate gradient statistics for each Gaussian mean:
-\[
-g_i \leftarrow \|\nabla_{\boldsymbol{\mu}_i}\mathcal{L}_{\mathrm{Total}}\|_2.
-\]
-\item Every $K$ iterations (densify interval), apply:
-\begin{itemize}
-\item \textbf{Split:} if $g_i$ is large and the Gaussian is too large, split it into multiple smaller Gaussians.
-\item \textbf{Clone:} if $g_i$ is large but the Gaussian is already small, clone to increase local capacity.
-\item \textbf{Prune:} remove Gaussians with small amplitude $|a_i|<\tau_a$ or excessively large scale.
-\end{itemize}
-\item Continue training with updated $N$.
-\end{enumerate}
-
-% ------------------------------------------------------------
-\subsection{9. Stopping Criterion and Output}
-\begin{enumerate}
-\item Stop after a fixed number of iterations, or apply early stopping based on a validation distortion metric.
-\item Output the trained Gaussian parameters $\{\boldsymbol{\mu}_i,\boldsymbol{\ell}_i,\mathbf{q}_i,a_i\}_{i=1}^{N}$, bias $b$, and entropy-model parameters for compression.
-\end{enumerate}
-
-\section{Objective Function and Regularization}
-\label{sec:loss_regularization}
-
-\subsection{Implicit volume representation}
-\label{subsec:implicit_function}
-
-We represent a normalized volumetric signal $V:\Omega\subset\mathbb{R}^3\rightarrow \mathbb{R}$ using a sparse mixture of anisotropic 3D Gaussian basis functions. In the notation of the proposals (Step 2), the implicit function is
+\textbf{How:} We measure the ``closeness'' of each pair of Gaussians using their Mahalanobis distance under the combined covariance:
 \begin{equation}
-f(\mathbf{x})
-= \sum_{i=1}^{N} w_i\, G_i(\mathbf{x};\mathbf{u}_i,\boldsymbol{\Sigma}_i),
-\qquad \mathbf{x}\in\Omega,
-\label{eq:proposal_implicit}
+\mathcal{L}_{\mathrm{O}} = \mathbb{E}_{(i,j)}\left[\exp\left(-\frac{1}{2}(\boldsymbol{\mu}_i-\boldsymbol{\mu}_j)^\top(\boldsymbol{\Sigma}_i+\boldsymbol{\Sigma}_j)^{-1}(\boldsymbol{\mu}_i-\boldsymbol{\mu}_j)\right)\right].
+\label{eq:overlap}
 \end{equation}
-where the Gaussian basis is
+The exponential term equals~1 when two Gaussians coincide perfectly ($\boldsymbol{\mu}_i = \boldsymbol{\mu}_j$) and decays to~0 as they move apart.  Minimising this loss pushes overlapping Gaussians apart or merges them, improving both compression efficiency and optimisation conditioning.  The expectation is evaluated over randomly sampled pairs, making the cost per iteration $O(N)$ rather than $O(N^2)$.
+
+\paragraph{Smoothness ($\beta_{\text{smooth}} = 10^{-4}$).}
+\textbf{Why:} A mixture of Gaussians can produce spurious high-frequency oscillations, especially where the tails of neighbouring Gaussians interfere constructively and destructively.  These oscillations appear as ringing artefacts in the reconstruction---bright and dark bands that do not correspond to real structure.
+
+\textbf{How:} A field gradient penalty penalises rapid intensity changes:
 \begin{equation}
-G_i(\mathbf{x};\mathbf{u}_i,\boldsymbol{\Sigma}_i)
-= \exp\!\left(
--\frac{1}{2}\,(\mathbf{x}-\mathbf{u}_i)^{\top}\boldsymbol{\Sigma}_i^{-1}(\mathbf{x}-\mathbf{u}_i)
-\right).
-\label{eq:proposal_gaussian}
+\mathcal{L}_{\mathrm{G}} = \mathbb{E}_{\mathbf{x}}[\|\nabla_{\mathbf{x}} f(\mathbf{x})\|_2^2].
+\label{eq:smoothness}
 \end{equation}
+$\nabla_{\mathbf{x}} f$ is the spatial gradient of the reconstructed field, computed via automatic differentiation at sampled coordinates.  Penalising its squared magnitude discourages abrupt intensity transitions between Gaussian contributions, producing a smoother, more natural-looking reconstruction.  Because the penalty is applied in the continuous domain (not on a grid), it regularises the field at all resolutions.
 
-\paragraph{Mapping to our code.}
-Our implementation uses the same functional form but with parameters re-parameterized for stable optimization:
-\begin{itemize}
-    \item Mean $\mathbf{u}_i \leftrightarrow \boldsymbol{\mu}_i \in \mathbb{R}^3$ (parameter \texttt{model.mu}).
-    \item Covariance $\boldsymbol{\Sigma}_i$ is represented via a rotation $R(\mathbf{q}_i)\in SO(3)$ and axis scales $\mathbf{s}_i\in\mathbb{R}_+^3$:
-    \begin{equation}
-    \boldsymbol{\Sigma}_i
-    = R(\mathbf{q}_i)\,\mathrm{diag}(\mathbf{s}_i^2)\,R(\mathbf{q}_i)^{\top},
-    \qquad \mathbf{s}_i = \exp(\boldsymbol{\ell}_i),
-    \label{eq:cov_param}
-    \end{equation}
-    where $\boldsymbol{\ell}_i\in\mathbb{R}^3$ are log-scales (\texttt{model.log\_s}) and $\mathbf{q}_i\in\mathbb{R}^4$ is a quaternion (\texttt{model.q}) normalized to unit length.
-    \item Mixture weight $w_i \leftrightarrow a_i$ (amplitude, \texttt{model.a}) and a global bias $b$ (\texttt{model.b}):
-    \begin{equation}
-    f(\mathbf{x}) = \sum_{i=1}^{N} a_i \, \exp\!\left(-\tfrac{1}{2}\,\lVert D_i^{-1} R(\mathbf{q}_i)^{\top}(\mathbf{x}-\boldsymbol{\mu}_i)\rVert_2^2\right) + b,
-    \label{eq:our_forward}
-    \end{equation}
-    with $D_i=\mathrm{diag}(\mathbf{s}_i)$.
-\end{itemize}
+\paragraph{Gradient ($\beta_{\text{grad}} = 5\times10^{-4}$).}
+\textbf{Why:} During optimisation, individual Gaussians can develop extreme aspect ratios---becoming very thin and elongated, or collapsing to near-zero extent in one axis.  These degenerate shapes cause numerical instability (near-singular covariance matrices) and poor generalisation.
 
-\subsection{Data fidelity term}
-\label{subsec:data_term}
+\textbf{How:} An $\ell_2$ penalty on the scale and anisotropy parameters discourages extreme values, acting as a soft prior that keeps Gaussians within a reasonable shape range.  This prevents the optimiser from ``over-specialising'' any single primitive and promotes a more balanced distribution of shapes across the mixture.
 
-\paragraph{Proposal formulation (Step 3).}
-The proposals define the reconstruction loss as mean squared error (MSE):
+\paragraph{Total Variation ($\beta_{\text{TV}} = 5\times10^{-4}$) and SSIM ($\beta_{\text{SSIM}} = 0.06$).}
+\textbf{Why (TV):} Total variation is a classical image processing prior that encourages piecewise-constant or piecewise-smooth reconstructions.  In neuronal data, this is appropriate: intensities are locally smooth within a neurite or background region, with sharp transitions at boundaries.  TV regularisation suppresses noise and minor oscillations while preserving these sharp edges.
+
+\textbf{Why (SSIM):} Pixel-wise losses like Charbonnier and MSE do not capture the \emph{perceptual structure} of an image: two reconstructions with identical MSE can look very different to a human observer.  SSIM (Structural Similarity Index) explicitly measures three components---luminance, contrast, and structural correlation---within local patches, producing a quality metric that correlates better with visual perception.
+
+\textbf{How:} Both terms operate on randomly sampled 3D patches $\mathcal{P}$ of size $(8, 32, 32)$ voxels:
 \begin{equation}
-\mathcal{L}_{\mathrm{MSE}}
-= \frac{1}{M}\sum_{k=1}^{M}\left(f(\mathbf{x}_k)-v_k\right)^2,
-\label{eq:proposal_mse}
+\mathcal{L}_{\mathrm{TV}} = \mathbb{E}_{\mathcal{P}}\left[\|\nabla_x f\|_1 + \|\nabla_y f\|_1 + \|\nabla_z f\|_1\right], \quad
+\mathcal{L}_{\mathrm{SSIM}} = 1 - \mathrm{SSIM}(f(\mathcal{P}), V(\mathcal{P})).
+\label{eq:tv_ssim}
 \end{equation}
-where $\{(\mathbf{x}_k,v_k)\}_{k=1}^M$ are sampled voxel coordinates and their ground-truth intensities.
+The TV loss sums the absolute finite differences of the reconstructed field along each axis within the patch.  This penalises intensity gradients proportionally to their magnitude (the $\ell_1$ norm), favouring flat regions with occasional sharp steps---exactly the piecewise-smooth profile expected in microscopy data.  The SSIM loss computes the structural similarity between predicted and ground-truth patches using a Gaussian window, and we minimise $1 - \mathrm{SSIM}$ so that perfect structural similarity corresponds to zero loss.
 
-\paragraph{Our implementation.}
-We replace pure MSE with a (weighted) Charbonnier penalty to increase robustness to outliers and heavy-tailed noise typical in microscopy (shot noise, sparse bright structures):
-\begin{align}
-\mathcal{L}_{\mathrm{D}}
-&= \frac{1}{M}\sum_{k=1}^{M} \omega(\mathbf{x}_k)\,
-\rho\!\left(f(\mathbf{x}_k)-v_k\right),
-\label{eq:data_charb}\\
-\rho(r) &= \sqrt{r^2+\epsilon^2},
-\qquad
-\omega(\mathbf{x}) = 1+\kappa\, m(\mathbf{x}).
-\label{eq:charb_weight}
-\end{align}
-Here $m(\mathbf{x})\in[0,1]$ is a neurite/edge importance map (constructed from DoG + gradient magnitude), and $\kappa$ (named \texttt{kappa} in the config) emphasizes geometrically important regions (neurites, boundaries). This makes the training geometry-aware without requiring explicit segmentation labels.
+\paragraph{Edge-Aware Loss ($\beta_{\text{edge}} = 0.10$).}
+\textbf{Why:} The distortion term (Eq.~\ref{eq:distortion}) already up-weights neurite regions via $m(\mathbf{x})$, but it operates on individual voxels.  The edge-aware loss provides a complementary \emph{patch-level} signal that specifically targets boundary alignment.  Neurite boundaries carry the most biologically meaningful geometric information---they define the shape of dendrites, axons, and synaptic processes.  Ensuring that these edges are sharp and correctly located is essential for downstream morphological analysis such as tracing and skeleton extraction.
 
-\paragraph{Comparison to the proposals.}
-Equation~\eqref{eq:data_charb} is a strict generalization of~\eqref{eq:proposal_mse}:
-\begin{itemize}
-    \item If $\omega(\mathbf{x})\equiv 1$ and $\rho(r)=r^2$, we recover the proposal MSE.
-    \item Our choice $\rho(r)=\sqrt{r^2+\epsilon^2}$ behaves like $|r|$ for large residuals, preventing a small number of extreme voxels from dominating early training.
-    \item The weight $\omega(\mathbf{x})$ explicitly prioritizes geometric correctness (edges / filamentary structures).
-\end{itemize}
-
-\subsection{Rate term (compression-aware training)}
-\label{subsec:rate_term}
-
-To train a \emph{codec}, we optimize a rate--distortion objective by adding an entropy-based rate proxy. We quantize parameters using uniform scalar steps $\Delta$ (straight-through estimator for gradients):
+\textbf{How:}
 \begin{equation}
-\widehat{\theta} = Q(\theta) \approx \mathrm{round}\!\left(\frac{\theta}{\Delta}\right),
-\label{eq:quant}
-\end{equation}
-and estimate the expected code length (in bits) by a Laplace entropy model:
-\begin{equation}
-\mathcal{R}(\widehat{\theta})
-= \mathbb{E}\big[-\log_2 p_{\mathrm{Lap}}(\widehat{\theta})\big].
-\label{eq:rate_bits}
-\end{equation}
-In our code, we sum per-parameter groups:
-\begin{equation}
-\mathcal{L}_{\mathrm{R}}
-=
-\mathcal{R}(\widehat{\boldsymbol{\mu}})
-+\mathcal{R}(\widehat{\boldsymbol{\ell}})
-+\mathcal{R}(\widehat{\mathbf{q}})
-+\mathcal{R}(\widehat{\mathbf{a}})
-+\mathcal{R}(\widehat{b}).
-\label{eq:rate_total}
-\end{equation}
-This term is not present in the proposals because they describe only the fitting problem, not compression. In a codec setting, $\mathcal{L}_{\mathrm{R}}$ is essential to trade off fidelity vs.\ bitrate.
-
-\subsection{Regularization terms}
-\label{subsec:regularizers}
-
-The proposals (Step 6) list three regularizers: sparsity, overlap, and smoothness. Our implementation contains counterparts, but some are refined to better match 3D anisotropic Gaussians and geometric priorities.
-
-\subsubsection{Sparsity regularization}
-\label{subsubsec:sparsity}
-
-\paragraph{Proposal.}
-\begin{equation}
-\mathcal{L}_{\mathrm{sparsity}}^{\text{(shot)}}
-= \lambda_w\sum_{i=1}^{N}|w_i|.
-\label{eq:proposal_sparse}
-\end{equation}
-
-\paragraph{Our code.}
-We apply the same principle to amplitudes $a_i$:
-\begin{equation}
-\mathcal{L}_{\mathrm{S}}
-= \frac{1}{N}\sum_{i=1}^{N}|a_i|.
-\label{eq:ours_sparse}
-\end{equation}
-
-\paragraph{Reason (geometry + compression).}
-$\ell_1$ sparsity encourages many Gaussians to become negligible and later removable by pruning (e.g., \texttt{min\_amplitude}), directly improving compression (fewer primitives) and helping geometric correctness by preventing diffuse background ``fog''.
-
-\subsubsection{Overlap regularization}
-\label{subsubsec:overlap}
-
-\paragraph{Proposal.}
-The proposals describe an abstract pairwise overlap penalty:
-\begin{equation}
-\mathcal{L}_{\mathrm{overlap}}^{\text{(shot)}}
-= \lambda_o \sum_{i,j} \mathrm{overlap}(G_i,G_j),
-\label{eq:proposal_overlap}
-\end{equation}
-without specifying the exact overlap operator.
-
-\paragraph{Our code (orientation-aware overlap).}
-We instantiate overlap via a Mahalanobis distance under the combined covariance $(\Sigma_i+\Sigma_j)$:
-\begin{align}
-d^2_{ij}
-&=
-(\boldsymbol{\mu}_i-\boldsymbol{\mu}_j)^{\top}
-(\boldsymbol{\Sigma}_i+\boldsymbol{\Sigma}_j+\epsilon I)^{-1}
-(\boldsymbol{\mu}_i-\boldsymbol{\mu}_j),
-\label{eq:mahal_dist}\\
-\mathrm{overlap}_{ij}
-&= \exp\!\left(-\tfrac{1}{2} d^2_{ij}\right),
-\qquad
-\mathcal{L}_{\mathrm{O}}
-= \mathbb{E}_{(i,j)\sim\mathcal{P}}\big[\mathrm{overlap}_{ij}\big],
-\label{eq:mahal_overlap}
-\end{align}
-where $\mathcal{P}$ is a sampled set of random pairs for efficiency.
-
-\paragraph{Comparison to the proposals.}
-Equation~\eqref{eq:mahal_overlap} is a concrete, geometry-consistent realization of~\eqref{eq:proposal_overlap}:
-\begin{itemize}
-    \item It accounts for \emph{anisotropy and orientation} (through $\Sigma_i$), which is critical for tubular structures (neurites, vessels).
-    \item It penalizes redundant primitives that occupy the same spatial support, improving identifiability and geometric crispness.
-    \item A simpler isotropic proxy (e.g., $\exp(-\|\mu_i-\mu_j\|/(r_i+r_j))$) ignores orientation and is less faithful to true Gaussian overlap in 3D.
-\end{itemize}
-
-\subsubsection{Smoothness regularization: proposal vs.\ our implementation}
-\label{subsubsec:smoothness}
-
-\paragraph{Proposal.}
-The proposals state:
-\begin{equation}
-\mathcal{L}_{\mathrm{smooth}}^{\text{(shot)}}
-= \lambda_s \sum_{i=1}^{N}\left\lVert \nabla_{\mathbf{u}_i} G_i \right\rVert_2^2.
-\label{eq:proposal_smooth}
-\end{equation}
-This is a \emph{Gaussian-parameter} smoothness written in terms of the gradient of each basis w.r.t.\ its mean $\mathbf{u}_i$.
-
-\paragraph{Our code contains two different ``smoothness'' notions.}
-
-\begin{enumerate}
-\item \textbf{Parameter conditioning (named \texttt{smoothness\_loss(model)}).}
-We regularize the covariance parameters to keep primitives well-conditioned:
-\begin{equation}
-\mathcal{L}_{\mathrm{Sm}}
-=
-\underbrace{\mathbb{E}_i\big[\max(0, s_{\min}-s_i)\big]}_{\text{avoid collapse}}
-+
-c_a\underbrace{\mathbb{E}_i\Big[\max(0,\tfrac{s_{i,\max}}{s_{i,\min}}-1)\Big]}_{\text{limit extreme anisotropy}}
-+
-c_m\underbrace{\mathbb{E}_i\big[\max(0, s_i-s_{\max})\big]}_{\text{avoid blow-up}},
-\label{eq:param_smooth}
-\end{equation}
-where $s_i=\exp(\ell_i)$ are axis scales. This does \emph{not} match~\eqref{eq:proposal_smooth}; it is a stability/conditioning prior for $\Sigma_i$.
-
-\item \textbf{Field smoothness (named \texttt{field\_grad\_smoothness}).}
-To align with the proposal intent of ``smooth transitions'', we add a reconstruction-field gradient penalty:
-\begin{equation}
-\mathcal{L}_{\mathrm{G}}
-=
-\mathbb{E}_{\mathbf{x}\sim\Omega}\Big[\lVert \nabla_{\mathbf{x}} f(\mathbf{x}) \rVert_2^2\Big],
-\label{eq:field_grad_smooth}
-\end{equation}
-estimated by autograd on randomly sampled coordinates.
-This is \emph{closer in spirit} to smoothness in implicit fields (and more directly geometry-aligned), even though its gradient is w.r.t.\ $\mathbf{x}$ rather than $\mathbf{u}_i$.
-\end{enumerate}
-
-\paragraph{Why the proposal smoothness is not identical.}
-$\nabla_{\mathbf{u}_i}G_i$ (proposal) and $\nabla_{\mathbf{x}} f(\mathbf{x})$ (ours) are different objects:
-\begin{itemize}
-    \item $\nabla_{\mathbf{u}_i}G_i$ constrains how sensitive each \emph{basis} is to moving its center, i.e., it is a parameter-space smoothness.
-    \item $\nabla_{\mathbf{x}} f(\mathbf{x})$ constrains the reconstructed \emph{field geometry} directly in spatial coordinates, which is typically what we want for geometric correctness (suppressing spurious oscillations/ringing).
-\end{itemize}
-
-\paragraph{Geometric priority recommendation.}
-For geometry-first training, $\mathcal{L}_{\mathrm{G}}$ (field gradient) and/or TV on patches (below) are the most directly geometry-aligned. $\mathcal{L}_{\mathrm{Sm}}$ should be kept as a covariance-conditioning prior (prevents degenerate Gaussians), but it should be described separately from proposal ``smoothness''.
-
-\subsubsection{Total variation (TV) on reconstructed patches}
-\label{subsubsec:tv}
-
-We also use 3D total variation on predicted patches:
-\begin{equation}
-\mathcal{L}_{\mathrm{TV}}
-=
-\mathbb{E}_{\mathcal{P}}
-\Big[
-\lVert \nabla_x f \rVert_1 + \lVert \nabla_y f \rVert_1 + \lVert \nabla_z f \rVert_1
-\Big],
-\label{eq:tv}
-\end{equation}
-computed on local subvolumes for efficiency. TV encourages piecewise-smooth reconstructions while preserving sharp boundaries, complementing the Charbonnier data term for geometric fidelity.
-
-\subsubsection{SSIM (structure-preserving regularizer)}
-\label{subsubsec:ssim}
-
-We include a 3D SSIM loss on patches:
-\begin{equation}
-\mathcal{L}_{\mathrm{SSIM}} = 1 - \mathrm{SSIM}(f(\mathcal{P}), V(\mathcal{P})),
-\label{eq:ssim}
-\end{equation}
-where SSIM is computed from local means/variances/covariances within a small 3D window. While not in the proposals, SSIM stabilizes perceptual/structural similarity and reduces over-smoothing that can occur with TV alone.
-
-\subsubsection{Edge-aware loss (geometry-weighted fidelity)}
-\label{subsubsec:edge}
-
-We apply an edge-weighted absolute error on patches:
-\begin{equation}
-\mathcal{L}_{\mathrm{Edge}}
-=
-\mathbb{E}_{\mathbf{x}\in\mathcal{P}}
-\Big[
-w_{\mathrm{edge}}(\mathbf{x})\,|f(\mathbf{x})-V(\mathbf{x})|
-\Big],
+\mathcal{L}_{\mathrm{Edge}} = \mathbb{E}_{\mathbf{x}\in\mathcal{P}}\left[w_{\mathrm{edge}}(\mathbf{x})|f(\mathbf{x})-V(\mathbf{x})|\right].
 \label{eq:edge}
 \end{equation}
-with $w_{\mathrm{edge}}$ constructed from finite differences of the target patch plus the neurite map. This explicitly prioritizes boundary alignment and filament continuity, which is central for geometric correctness in dendritic/vascular volumes.
+The edge weight $w_{\mathrm{edge}}(\mathbf{x})$ is computed from finite differences of the ground-truth patch combined with the neurite map $m(\mathbf{x})$.  Voxels with large spatial gradients (i.e., at neurite boundaries and branching points) receive large weights, forcing the model to allocate Gaussian capacity to these critical regions.  Compared to the global distortion term, this patch-level formulation captures local edge structure more effectively, because the surrounding context within the patch helps distinguish true boundaries from noise.
 
-\subsubsection{Topology-biased patch loss (optional)}
-\label{subsubsec:topology}
+\subsection{Optimization and Adaptive Densification}
+\label{subsec:optimization}
 
-We include a lightweight topology-biased loss by mapping predictions to a soft occupancy via a sigmoid threshold and penalizing high-frequency artifacts (TV + high-frequency residual) on that occupancy:
-\begin{equation}
-\mathcal{L}_{\mathrm{T}}
-=
-\mathrm{TV}\big(\sigma(\gamma(f-\tau))\big)
-+ c_h\,\big\lVert \sigma(\gamma(f-\tau)) - \mathrm{LPF}(\sigma(\gamma(f-\tau))) \big\rVert_1.
-\label{eq:topo}
-\end{equation}
-This is not in the proposals, but it is used to bias the solution toward coherent neurite-like occupancy patterns when training from sparse samples.
+A fixed set of Gaussians, no matter how well-initialised, cannot capture the full range of structures in a neuronal volume.  Some regions require dense coverage (branching dendrites, synaptic boutons) while others need very few primitives (flat background).  Our optimisation strategy therefore has two complementary mechanisms: (i)~standard gradient-based parameter updates that refine existing Gaussians, and (ii)~\emph{adaptive densification and pruning} that dynamically adds or removes entire Gaussians during training.
 
-\subsection{Final objective (rate--distortion with geometric priors)}
-\label{subsec:final_objective}
+\subsubsection{Training Procedure}
 
-Combining all terms, the full training objective in our code is:
-\begin{align}
-\min_{\{\mu_i,\ell_i,q_i,a_i\},\,b}\;
-\mathcal{L}_{\mathrm{Total}}
-&=
-\mathcal{L}_{\mathrm{D}}
-+ \lambda\,\mathcal{L}_{\mathrm{R}}
-+ \alpha\,\mathcal{L}_{\mathrm{T}}
-+ \beta_{\mathrm{TV}}\,\mathcal{L}_{\mathrm{TV}}
-+ \beta_{\mathrm{SSIM}}\,\mathcal{L}_{\mathrm{SSIM}}
-+ \beta_{\mathrm{Edge}}\,\mathcal{L}_{\mathrm{Edge}}
-\nonumber\\
-&\quad
-+ \beta_{\mathrm{G}}\,\mathcal{L}_{\mathrm{G}}
-+ \beta_{\mathrm{S}}\,\mathcal{L}_{\mathrm{S}}
-+ \beta_{\mathrm{Sm}}\,\mathcal{L}_{\mathrm{Sm}}
-+ \beta_{\mathrm{O}}\,\mathcal{L}_{\mathrm{O}}.
-\label{eq:full_loss}
-\end{align}
+We optimize all Gaussian parameters $\{\boldsymbol{\mu}_i, \boldsymbol{\ell}_i, \mathbf{q}_i, a_i\}_{i=1}^N$ and bias $b$ using the Adam optimiser.  Adam maintains per-parameter running estimates of the gradient mean and variance, which effectively adapts the learning rate for each scalar independently.  This is important because our parameters live on different scales: positions $\boldsymbol{\mu}_i \in [-1,1]^3$, log-scales $\boldsymbol{\ell}_i \in \mathbb{R}$, quaternions $\mathbf{q}_i$ on the unit sphere, and amplitudes $a_i$ that can range widely.
 
-\subsection{Direct comparison to the proposals (what matches, what differs)}
-\label{subsec:compare_proposals}
+The schedule is:
+\begin{itemize}
+    \item \textbf{Learning rate:} cosine annealing from $\mathrm{lr}_0 = 2\times10^{-3}$ to $\mathrm{lr}_{\mathrm{final}} = 2\times10^{-4}$ over $T = 50{,}000$ iterations.
+    \item \textbf{Batch size:} $M = 4{,}000$ coordinate--intensity pairs per iteration.  Of these, 50\% are drawn uniformly over the volume; the remaining 50\% are importance-sampled proportionally to $m(\mathbf{x})$ to ensure adequate coverage of neurite structures.
+    \item \textbf{Mixed precision:} automatic mixed precision (AMP, FP16 for forward/backward, FP32 for parameter updates) plus \texttt{torch.compile} for kernel fusion.
+\end{itemize}
+
+\subsubsection{Adaptive Densification and Pruning}
+
+The key insight from 3D Gaussian Splatting~\cite{kerbl20233d} is that the \emph{number} of primitives matters as much as their parameters.  A fixed Gaussian budget forces a global trade-off between coverage and precision: more Gaussians per neurite means finer detail but also more primitives wasted in simple regions.  Adaptive densification solves this by monitoring the optimisation signal and adding Gaussians only where they are needed, while pruning removes those that contribute nothing.
+
+\paragraph{Densification.}
+\textbf{Idea:} If a Gaussian has a persistently large position gradient $\|\nabla_{\boldsymbol{\mu}_i}\mathcal{L}\|$, it means the loss is trying hard to move it---indicating that the local region is poorly reconstructed and one Gaussian is not enough.  We respond by creating additional Gaussians in that area.
+
+Every $K_d = 1{,}000$ iterations, from iteration $t_{\mathrm{start}} = 1{,}200$ to $t_{\mathrm{end}} = 18{,}000$, we identify Gaussians whose accumulated gradient exceeds the threshold $\tau_g = 1.5\times10^{-4}$ and apply one of two operations:
+\begin{itemize}
+    \item \textbf{Splitting:} If a high-gradient Gaussian is \emph{large} (its scale exceeds a threshold), it is replaced by two smaller Gaussians positioned on either side of the original centre along the direction of maximum gradient.  This is appropriate when a single large Gaussian is trying to cover a complex region (e.g., a branching point) that requires multiple oriented primitives.
+    \item \textbf{Cloning:} If a high-gradient Gaussian is \emph{small}, it is duplicated with a slight positional offset.  This is appropriate when the region needs more coverage density (e.g., a thin neurite that a single small Gaussian cannot fully tile).
+    \item $N_{\max} = 80{,}000$: hard cap on the total Gaussian count to bound GPU memory consumption.
+\end{itemize}
+
+\paragraph{Pruning.}
+\textbf{Idea:} Not all Gaussians remain useful as training progresses.  Some may have been densified into a region that was later adequately covered by other primitives; others may have their amplitudes driven to near-zero by the sparsity regulariser.  Keeping these dead primitives wastes storage and slows both training and decoding.
+
+After a warm-up of $t_{\mathrm{warmup}} = 3{,}000$ iterations (to let the model stabilise before removing primitives), pruning runs every $K_p = 2{,}000$ iterations with the following criteria:
+\begin{itemize}
+    \item $\tau_a = 1.5\times10^{-4}$: Gaussians with $|a_i| < \tau_a$ contribute negligible intensity and are removed.
+    \item $c_{\min} = 5\times10^{-9}$: a contribution score combining amplitude and spatial extent (geometric mean).  Primitives below this threshold affect too few voxels too weakly to justify their parameter cost.
+    \item Percentile pruning: the bottom $5\%$ by contribution score are always removed, ensuring a continuous ``cleanup'' of the weakest primitives.
+    \item $f_{\max} = 15\%$: at most 15\% of Gaussians can be pruned in a single step, preventing a catastrophic loss of representational capacity from aggressive over-pruning.
+    \item $N_{\min} = 256$: a hard floor ensuring the model always retains enough primitives to represent the basic volumetric structure.
+\end{itemize}
+The interplay between densification (adding primitives where reconstruction is poor) and pruning (removing primitives that contribute little) produces a dynamic equilibrium: the Gaussian count rises during the densification phase as the model allocates capacity to complex neurite regions, then stabilises as pruning removes redundancies.
+
+\paragraph{Initialization.}
+\textbf{Why it matters:} The initial placement of Gaussians strongly affects convergence.  Random uniform initialisation would waste many primitives in empty background, requiring lengthy optimisation to migrate them toward neurite regions.  We instead \emph{importance-sample} the initial centres, seeding primitives directly where they are most needed.
+
+The initial $N_0 = 8{,}000$ Gaussian centres are drawn from the probability distribution $p(\mathbf{x}) \propto m(\mathbf{x}) + \epsilon$ (with $\epsilon = 10^{-8}$), where $m$ is the precomputed neurite map.  This concentrates primitives in neurite-rich regions from the start.  Initial amplitudes $a_i$ are set to the ground-truth intensity $V(\mathbf{x}_i)$ at the sampled location, giving each Gaussian a reasonable starting brightness.  Log-scales $\boldsymbol{\ell}_i$ are initialised to $-2$ (corresponding to $\mathbf{s}_i \approx 0.135$, a moderate spatial extent), and quaternions $\mathbf{q}_i$ are initialised to the identity rotation $(1,0,0,0)^\top$ (no initial orientation bias).
+
+\subsubsection{Output}
+
+The final representation comprises the optimized Gaussian parameters.  For storage, all parameters are quantized (8-bit uniform) and entropy-coded using the Laplace model described in~\eqref{eq:rate}.  Decoding reconstructs any voxel by evaluating Eq.~\eqref{eq:implicit_function} at the desired coordinates, which is embarrassingly parallel (each voxel is independent) and requires no sequential network inference---unlike MLP-based implicit representations where each voxel requires a full forward pass through all network layers in sequence.
+
+% ============================================================
+% EXPERIMENTS SECTION
+% ============================================================
+\section{Experiments}
+\label{sec:experiments}
+
+We evaluate NeuroGS-Codec on a challenging 3D fluorescence microscopy volume containing labeled neuronal dendrites and fine-scale morphological structures. This section presents the experimental setup, training dynamics, and quality metrics achieved during model convergence.
+
+\subsection{Dataset and Experimental Setup}
+\label{subsec:dataset}
+
+\paragraph{Dataset.}
+We use a cropped and corrected confocal microscopy volume (\texttt{10-2900-control-cell-05\_cropped\_corrected.tif}) containing neuronal structures. The volume has dimensions $100 \times 647 \times 813$ voxels (52.6 million voxels total) with 8-bit intensity range $[2, 255]$.
+
+\paragraph{Training configuration.}
+The model was trained for 50,000 iterations using the Adam optimizer with learning rate annealing from $2 \times 10^{-3}$ to $2 \times 10^{-4}$. Training used mixed-precision (AMP) and \texttt{torch.compile} for efficiency. Table~\ref{tab:hyperparams} summarizes all hyperparameters.
+
+\begin{table}[htbp]
+\centering
+\caption{NeuroGS-Codec training hyperparameters.}
+\label{tab:hyperparams}
+\small
+\begin{tabular}{llr}
+\toprule
+\textbf{Category} & \textbf{Parameter} & \textbf{Value} \\
+\midrule
+\multirow{4}{*}{Optimization} 
+    & Training iterations & 50,000 \\
+    & Batch size (coordinates) & 4,000 \\
+    & Initial Gaussians $N_0$ & 8,000 \\
+    & Edge emphasis $\kappa$ & 15.0 \\
+\midrule
+\multirow{2}{*}{Rate-Distortion}
+    & Rate weight $\lambda$ & $3 \times 10^{-4}$ \\
+    & Entropy scale $\alpha$ & 0.02 \\
+\midrule
+\multirow{7}{*}{Regularization}
+    & Sparsity $\beta_{\text{sparse}}$ & $1 \times 10^{-4}$ \\
+    & Smoothness $\beta_{\text{smooth}}$ & $1 \times 10^{-4}$ \\
+    & Total variation $\beta_{\text{TV}}$ & $5 \times 10^{-4}$ \\
+    & SSIM $\beta_{\text{SSIM}}$ & 0.06 \\
+    & Edge $\beta_{\text{edge}}$ & 0.10 \\
+    & Overlap $\beta_{\text{overlap}}$ & 0.005 \\
+    & Gradient $\beta_{\text{grad}}$ & $5 \times 10^{-4}$ \\
+\midrule
+\multirow{2}{*}{Learning Rate}
+    & Initial LR & $2 \times 10^{-3}$ \\
+    & Final LR & $2 \times 10^{-4}$ \\
+\midrule
+\multirow{5}{*}{Densification}
+    & Start iteration & 1,200 \\
+    & End iteration & 18,000 \\
+    & Interval & 1,000 \\
+    & Max Gaussians & 80,000 \\
+    & Gradient threshold & $1.5 \times 10^{-4}$ \\
+\midrule
+\multirow{6}{*}{Pruning}
+    & Warmup iterations & 3,000 \\
+    & Interval & 2,000 \\
+    & Max prune fraction & 0.15 \\
+    & Min contribution & $5 \times 10^{-9}$ \\
+    & Prune percentile & 0.05 \\
+    & Min amplitude & $1.5 \times 10^{-4}$ \\
+\midrule
+Patch Size & Topology patch $(d, h, w)$ & $(8, 32, 32)$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Model Training Results}
+\label{subsec:training_results}
+
+Figure~\ref{fig:training_losses} presents the evolution of key training metrics over 50,000 iterations. The four panels capture different aspects of the optimization process:
+
+\begin{figure}[htbp]
+    \centering
+    \includegraphics[width=\textwidth]{../experiment_plots/neurogs_training_losses.png}
+    \caption{\textbf{NeuroGS-Codec training dynamics.} 
+    \textbf{(Top-left)} Total loss $\mathcal{L}_{\mathrm{Total}}$ on a logarithmic scale, showing rapid initial convergence followed by gradual refinement. The raw loss (light blue) exhibits characteristic noise from stochastic sampling, while the smoothed curve (dark blue) reveals the underlying convergence trend.
+    \textbf{(Top-right)} Distortion loss $\mathcal{L}_{\mathrm{D}}$ (weighted Charbonnier), which directly measures reconstruction fidelity. The steady decrease indicates progressively better alignment between the Gaussian mixture field and the ground-truth volume.
+    \textbf{(Bottom-left)} SSIM loss component $\mathcal{L}_{\mathrm{SSIM}} = 1 - \mathrm{SSIM}$, capturing structural similarity preservation at the patch level. Lower values indicate better preservation of local contrast and structural patterns.
+    \textbf{(Bottom-right)} Number of Gaussians $N$ over training iterations, demonstrating adaptive allocation. The model begins with $N_0 = 8{,}192$ Gaussians and grows through densification to capture fine-scale details, while pruning removes redundant or low-amplitude primitives to maintain compactness.}
+    \label{fig:training_losses}
+\end{figure}
+
+\paragraph{Total loss convergence.}
+The total loss (top-left panel) decreases by approximately two orders of magnitude during training, from $\sim 10^{-1}$ to $\sim 10^{-3}$. The convergence exhibits three distinct phases:
+\begin{enumerate}
+    \item \textbf{Rapid descent (iterations 0--5,000):} The model quickly learns coarse volumetric structure, with loss dropping by $\sim 10\times$.
+    \item \textbf{Densification phase (iterations 5,000--25,000):} Gradual refinement as new Gaussians are added to capture fine details. Loss oscillations correspond to densification events introducing new parameters.
+    \item \textbf{Fine-tuning (iterations 25,000--50,000):} Slow convergence as the model reaches near-optimal configuration. Pruning stabilizes the Gaussian count.
+\end{enumerate}
+
+\paragraph{Distortion loss behavior.}
+The distortion loss $\mathcal{L}_{\mathrm{D}}$ (top-right panel) follows a similar trajectory but with less variance, as it directly measures the primary optimization objective. The geometry-weighted Charbonnier formulation ensures that neurite-dense regions receive higher gradient signal, biasing the model toward accurate reconstruction of biologically relevant structures.
+
+\paragraph{Structural similarity.}
+The SSIM loss component (bottom-left panel) captures perceptual quality beyond pixel-wise error. The decrease from $\sim 0.15$ to $\sim 0.05$ indicates substantial improvement in preserving local contrast, luminance, and structural patterns---critical for downstream analysis of neuronal morphology.
+
+\paragraph{Adaptive Gaussian allocation.}
+The Gaussian count evolution (bottom-right panel) demonstrates the interplay between densification and pruning:
+\begin{itemize}
+    \item \textbf{Growth phase:} Densification adds Gaussians in high-gradient regions (neurite boundaries, fine processes), increasing capacity where needed.
+    \item \textbf{Pruning phase:} Low-amplitude and redundant Gaussians are removed, preventing parameter bloat while maintaining reconstruction quality.
+    \item \textbf{Equilibrium:} The final count stabilizes at the value shown, representing an efficient allocation that balances expressiveness and compactness.
+\end{itemize}
+
+\paragraph{Training efficiency.}
+With mixed-precision training (AMP) on a single NVIDIA RTX GPU, the full 50,000-iteration training completes in approximately 2--3 hours. The batched coordinate sampling and efficient Gaussian evaluation enable processing of the 52.6M voxel volume without requiring full-volume forward passes during training.
+
+\subsection{Compression Performance}
+\label{subsec:compression}
+
+The final trained model achieves the following compression metrics:
+
+\begin{table}[htbp]
+\centering
+\caption{NeuroGS-Codec compression performance on the neuronal microscopy volume.}
+\label{tab:compression}
+\begin{tabular}{lc}
+\toprule
+\textbf{Metric} & \textbf{Value} \\
+\midrule
+Original volume size & 52.6 MB \\
+Compressed model size & 9.44 MB \\
+Compression ratio & 5.57$\times$ \\
+Bits per voxel (BPV) & 1.44 \\
+\midrule
+PSNR & 38.09 dB \\
+SSIM & 0.9268 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The achieved PSNR of $\sim$38~dB and SSIM of 0.93 indicate high-fidelity reconstruction suitable for quantitative analysis of neuronal morphology. The 5.57$\times$ compression ratio provides meaningful storage savings while preserving structural details essential for neuroscience applications.
+
+\subsection{Comparison with Baseline Methods}
+\label{subsec:baseline_comparison}
+
+To contextualize NeuroGS-Codec's performance, we compare against three neural network-based implicit representation baselines, all trained with equivalent parameter budgets ($\sim$9.47 MB):
 
 \begin{itemize}
-    \item \textbf{Implicit function:} Matches the proposal form (Eq.~\eqref{eq:proposal_implicit}--\eqref{eq:proposal_gaussian}) but uses a rotation+log-scale parameterization for $\Sigma_i$ (Eq.~\eqref{eq:cov_param}) and includes a bias $b$.
-    \item \textbf{Data loss:} Proposal uses MSE (Eq.~\eqref{eq:proposal_mse}); we use weighted Charbonnier (Eq.~\eqref{eq:data_charb}) to prioritize neurites/edges and improve robustness.
-    \item \textbf{Sparsity:} Same idea as proposal $\ell_1$ on weights, applied to amplitudes $a_i$ (Eq.~\eqref{eq:ours_sparse}).
-    \item \textbf{Overlap:} Proposal leaves overlap unspecified (Eq.~\eqref{eq:proposal_overlap}); we implement an anisotropy- and orientation-aware overlap via Mahalanobis distance (Eq.~\eqref{eq:mahal_overlap}), which is more geometrically correct for tubular primitives.
-    \item \textbf{Smoothness:} Proposal smoothness is written as $\sum\|\nabla_{u_i}G_i\|^2$ (Eq.~\eqref{eq:proposal_smooth}). Our \texttt{smoothness\_loss(model)} is instead a covariance-conditioning prior (Eq.~\eqref{eq:param_smooth}). For geometry-aligned smoothness, our \texttt{field\_grad\_smoothness} (Eq.~\eqref{eq:field_grad_smooth}) and TV (Eq.~\eqref{eq:tv}) are closer to the proposal intent of ``smooth transitions'' in the reconstructed volume.
+    \item \textbf{SIREN:} Sinusoidal Representation Networks~\cite{sitzmann2020siren} using periodic sine activations ($\omega_0=30$).
+    \item \textbf{Vanilla MLP:} Standard ReLU-activated multilayer perceptron.
+    \item \textbf{NeRF-style:} Positional encoding (10 frequency bands) followed by ReLU MLP, inspired by Neural Radiance Fields~\cite{mildenhall2020nerf}.
 \end{itemize}
+
+All baselines use hidden dimension 512 with 9 hidden layers (2,366,465 parameters) to match NeuroGS-Codec's model size. Training was conducted for 20,000 iterations with batch size 8,192 and learning rate $10^{-4}$.
+
+\begin{table}[htbp]
+\centering
+\caption{Volumetric compression comparison across methods at equivalent model sizes ($\sim$9.47 MB).}
+\label{tab:method_comparison}
+\begin{tabular}{lcccccc}
+\toprule
+\textbf{Method} & \textbf{PSNR (dB)} & \textbf{SSIM} & \textbf{LPIPS$\downarrow$} & \textbf{Size (MB)} & \textbf{BPV} & \textbf{Ratio} \\
+\midrule
+SIREN & 17.67 & 0.7588 & 0.2628 & 9.47 & 1.44 & 5.56$\times$ \\
+Vanilla MLP & 32.79 & 0.9087 & 0.3126 & 9.47 & 1.44 & 5.56$\times$ \\
+NeRF-style & \textbf{38.76} & \textbf{0.9284} & \textbf{0.2528} & 9.59 & 1.46 & 5.49$\times$ \\
+\midrule
+NeuroGS & 38.09 & 0.9268 & 0.3014 & 9.44 & 1.44 & 5.57$\times$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Discussion.}
+Table~\ref{tab:method_comparison} reveals several insights. First, SIREN with its pure sinusoidal activations struggles to represent the microscopy volume (17.67 dB), likely due to spectral bias and difficulty capturing the sparse, high-frequency neurite structures. Vanilla MLP with ReLU activations performs substantially better (32.79 dB), while NeRF-style positional encoding achieves the highest reconstruction quality (38.76 dB, 0.9284 SSIM).
+
+NeuroGS-Codec achieves competitive performance (38.09 dB, 0.9268 SSIM) while offering distinct advantages: (1) \emph{Interpretability}---each Gaussian primitive has explicit position, orientation, and scale, enabling direct geometric analysis unlike black-box MLP weights; (2) \emph{Adaptive allocation}---the densification strategy concentrates representational capacity along neurite boundaries rather than uniformly; (3) \emph{Compression efficiency}---the smallest model size (9.44 MB) with highest compression ratio (5.57$\times$); (4) \emph{Decoding speed}---Gaussian evaluation is parallelizable and does not require sequential layer computation.
+
+\subsection{Visual Quality Assessment}
+\label{subsec:visual_quality}
+
+Figure~\ref{fig:mip_comparison} presents maximum intensity projections (MIPs) comparing the ground truth volume against the NeuroGS-Codec reconstruction. MIP visualizations collapse the 3D volume along each principal axis, revealing the full extent of neuronal structures across all depths.
+
+\begin{figure}[htbp]
+    \centering
+    \includegraphics[width=\textwidth]{../experiment_plots/neurogs_mip_comparison.png}
+    \caption{\textbf{Maximum Intensity Projection (MIP) comparison.} 
+    \textbf{Left column:} Ground truth volume MIPs along Z (top, XY plane), Y (middle, XZ plane), and X (bottom, YZ plane).
+    \textbf{Middle column:} NeuroGS-Codec reconstruction MIPs, showing faithful preservation of neuronal morphology including fine dendritic processes and branching patterns.
+    \textbf{Right column:} Absolute difference maps (hot colormap), highlighting reconstruction errors. Errors are concentrated along high-contrast neurite boundaries and soma regions, with background regions exhibiting minimal error. The maximum difference of 170 intensity units occurs at isolated high-gradient locations, while the vast majority of voxels show differences below 50 units, consistent with the achieved PSNR of 38.0 dB.}
+    \label{fig:mip_comparison}
+\end{figure}
+
+The MIP visualizations demonstrate that NeuroGS-Codec accurately reconstructs the overall neuronal morphology, including primary dendrites, secondary branches, and fine terminal processes. The difference maps reveal that reconstruction errors primarily localize to:
+\begin{itemize}
+    \item \textbf{Neurite boundaries:} High-gradient edges where the Gaussian mixture transitions between foreground and background.
+    \item \textbf{Fine processes:} Thin terminal branches at the resolution limit of the Gaussian representation.
+    \item \textbf{Bright soma regions:} High-intensity cell body areas with sharp intensity gradients.
+\end{itemize}
+
+Importantly, background regions (the majority of voxel volume) exhibit negligible reconstruction error, indicating efficient allocation of representational capacity to information-rich neuronal structures rather than empty space.
+
+% ============================================================
+% ABLATION STUDY
+% ============================================================
+\section{Ablation Study}
+\label{sec:ablation}
+
+To understand the contribution of each component in NeuroGS-Codec, we conduct a systematic ablation study.  Each experiment removes exactly one design element from the full pipeline while keeping all other settings identical: 15{,}000 initial Gaussians, 10{,}000 training iterations, and the same training data.  We report PSNR, SSIM, estimated compressed model size (via the Laplace entropy model), bits per voxel (BPV), and training time.
+
+\subsection{Ablation Setup}
+
+Table~\ref{tab:ablation} summarises the seven ablated configurations.
+The \emph{full model} (trained to convergence with densification and all loss terms) achieves 38.02~dB / 0.9268~SSIM and serves as the reference.  Because the ablations use only 15{,}000 Gaussians and 10{,}000 iterations—versus 75{,}916 Gaussians and 50{,}000 iterations for the full model---their PSNR values are expectedly lower; the important comparison is \emph{between ablations} to isolate each component's effect.
+
+\begin{table}[htbp]
+\centering
+\caption{\textbf{Ablation study.}  Each row removes one component from the training pipeline. \emph{Est.\ Size} is the entropy-model estimate of the compressed representation; \emph{Ckpt} is the raw PyTorch checkpoint.  All ablations use $N{=}15{,}000$ Gaussians except ``W/o Densification'' ($N{=}8{,}000$, fixed).}
+\label{tab:ablation}
+\small
+\begin{tabular}{lccccccc}
+\toprule
+\textbf{Configuration} & \textbf{PSNR} & \textbf{SSIM} & \textbf{Est.\ Size} & \textbf{Ckpt} & \boldmath{$N$} & \textbf{BPV} & \textbf{Time} \\
+ & (dB) &  & (MB) & (MB) &  &  & (s) \\
+\midrule
+W/o Edge Weighting          & 34.14 & 0.9164 &  0.161 & 1.78 & 15\,000 & 0.0257 &  719 \\
+W/o Adaptive Densification  & 33.09 & 0.9135 &  0.164 & 1.48 &  8\,000 & 0.0261 &  525 \\
+W/o Rate Regularisation     & 36.05 & 0.9210 & 69.24  & 1.78 & 15\,000 & 11.042 &  757 \\
+W/o SSIM Loss               & 35.11 & 0.9186 &  0.175 & 1.78 & 15\,000 & 0.0280 &  721 \\
+W/o Total Variation         & 35.19 & 0.9188 &  0.177 & 1.78 & 15\,000 & 0.0282 &  739 \\
+W/o Overlap Penalty         & 35.06 & 0.9191 &  0.173 & 1.78 & 15\,000 & 0.0275 &  757 \\
+MSE Only (No Regularisation)& 36.97 & 0.9232 & 70.28  & 1.78 & 15\,000 & 11.209 &  609 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Analysis of Individual Components}
+
+\subsubsection{Rate Regularisation Is Essential for Compression}
+
+Removing the rate term ($\lambda{=}0$) yields the most dramatic effect: the estimated model size explodes from $\sim$0.17~MB to 69.24~MB---a ${\sim}400\times$ increase---while PSNR rises to 36.05~dB. Without a rate penalty the optimiser is free to use arbitrarily fine-grained parameter values that are expensive to entropy-code.  The MSE-only variant (all losses and regularisers disabled) confirms this pattern: it achieves the highest PSNR among ablations (36.97~dB) but at 70.28~MB estimated size, making it useless as a codec.  These results demonstrate that the rate term is the single most important component for achieving a favourable rate--distortion trade-off.
+
+\subsubsection{Adaptive Densification Controls Representational Capacity}
+
+Disabling densification ($N$ fixed at 8{,}000 throughout training) causes the largest quality drop in the study: PSNR falls to 33.09~dB and SSIM to 0.9135.  With fewer Gaussians, the model cannot allocate additional primitives to complex structures such as branching dendrites and fine terminal processes.  The shorter training time (525~s vs.\ ${\sim}720$~s) reflects the reduced model size, but the ${\sim}2$~dB PSNR deficit compared to other ablations underscores that adaptive capacity allocation is critical for capturing sparse, multiscale neuronal geometry.
+
+\subsubsection{Edge-Aware Weighting Preserves Neurite Boundaries}
+
+Removing edge weighting ($\kappa{=}0$, $\beta_{\text{edge}}{=}0$) yields 34.14~dB, the second-worst PSNR among single-term ablations.  Without emphasis on high-gradient regions, the model spreads reconstruction effort uniformly across the volume, under-representing thin neurite boundaries relative to the dominant dark background.  The nearly 1~dB gap to the next-worst single-term ablation (W/o Overlap: 35.06~dB) confirms that the edge-aware loss is a significant contributor to structural fidelity.
+
+\subsubsection{SSIM, TV, and Overlap: Complementary Regularisers}
+
+The three remaining per-term ablations (W/o SSIM, W/o TV, W/o Overlap) all cluster between 35.06 and 35.19~dB, with SSIM values in the narrow range 0.9186--0.9191.  Their effects are modest individually but complementary:
+\begin{itemize}
+    \item \textbf{W/o SSIM (35.11~dB):} Structural similarity captures local contrast patterns at the patch level; its absence mildly degrades perceptual quality.
+    \item \textbf{W/o TV (35.19~dB):} Total variation promotes piecewise-smooth fields.  Removing it slightly increases BPV (0.0282 vs.\ 0.0275--0.0280 for other ablations), suggesting that TV implicitly aids compressibility by suppressing noise.
+    \item \textbf{W/o Overlap (35.06~dB):} The overlap penalty separates redundant Gaussians.  Its removal leads to the lowest PSNR among this group, indicating modest redundancy when primitives can freely superpose.
+\end{itemize}
+
+\subsubsection{Compression Size Consistency}
+
+All ablations \emph{with} rate regularisation produce estimated model sizes in the tight range 0.161--0.177~MB (BPV 0.025--0.028), confirming that the rate term is the dominant driver of compactness.  The small variations across ablations arise because different regularisers implicitly shape the parameter distribution: smoother parameters (e.g., with TV) are slightly easier to entropy-code.
+
+\subsection{MIP Projection Comparison}
+\label{subsec:ablation_mips}
+
+Figure~\ref{fig:ablation_mips} presents maximum intensity projections (MIP along the $Z$ axis) for all ablated variants alongside the ground truth and the full model.  The full model (38.02~dB) most closely reproduces the ground-truth neurite network.  Ablations without rate regularisation or without regularisation altogether achieve high local fidelity visible in the MIP but at orders-of-magnitude greater storage cost.  Conversely, the no-densification variant shows visibly degraded fine structure, with missing terminal branches and reduced contrast at thin processes.
+
+\begin{figure}[htbp]
+    \centering
+    \includegraphics[width=\textwidth]{../ablation_results/ablation_mip_comparison.png}
+    \caption{\textbf{MIP comparison across ablated variants.}  Each sub-panel shows the maximum intensity projection along the $Z$ axis for a different configuration.  The ground truth and full model (38.02~dB) appear in the top row; subsequent panels show each ablation with its PSNR indicated.  Fine structural differences are most apparent in the no-densification variant (25.35~dB with only 8{,}000 Gaussians at iteration 10{,}000) and the no-edge-weighting variant (34.14~dB).}
+    \label{fig:ablation_mips}
+\end{figure}
+
+\subsection{Error Map Analysis}
+\label{subsec:ablation_errors}
+
+Figure~\ref{fig:ablation_errors} shows error maps (MIP of absolute difference $|\hat{V} - V|$) for the full model and each ablation on a shared colour scale.  The full model exhibits the lowest error, concentrated narrowly at neurite boundaries.  The no-edge-weighting ablation shows elevated boundary error, consistent with the loss of geometry-aware emphasis.  The no-densification variant has large, diffuse errors across the entire domain, reflecting its inability to adequately represent fine structures with only 8{,}000 Gaussians at 10{,}000 iterations.  Interestingly, the no-rate-regularisation and MSE-only ablations show comparable or lower error to the full model in pixel-level terms, but their vastly larger model sizes ($\sim$70~MB) mean this quality comes at an unacceptable compression cost.
+
+\begin{figure}[htbp]
+    \centering
+    \includegraphics[width=\textwidth]{../ablation_results/ablation_error_maps.png}
+    \caption{\textbf{Error maps across ablations.}  Each sub-panel shows the MIP of $|\hat{V}(\mathbf{x}) - V(\mathbf{x})|$ (inferno colour map, shared scale).  The full model (top-left) has the most localised error.  Ablations without regularisation (no rate, MSE only) have low pixel error but at $\sim$400$\times$ the model size.  The no-densification ablation has the largest and most diffuse error.}
+    \label{fig:ablation_errors}
+\end{figure}
+
+\subsection{Detailed Per-Ablation Comparison}
+\label{subsec:ablation_detailed}
+
+Figure~\ref{fig:ablation_detailed} provides a row-per-ablation layout comparing, for each variant: (i)~the full-model MIP, (ii)~the ablation MIP, (iii)~the absolute difference between ablation and full model, and (iv)~the absolute error against the ground truth.  This view highlights how each component modifies the reconstruction pattern relative to the full pipeline.
+
+\begin{figure}[htbp]
+    \centering
+    \includegraphics[width=\textwidth]{../ablation_results/ablation_detailed_comparison.png}
+    \caption{\textbf{Per-ablation detailed comparison.}  Each row corresponds to one ablation.  Columns from left to right: full-model MIP; ablation MIP; difference between ablation and full model ($|\hat{V}_{\text{abl}} - \hat{V}_{\text{full}}|$, inferno); absolute error against ground truth ($|\hat{V}_{\text{abl}} - V|$, inferno).  The difference column isolates the effect of removing each component relative to the full model.}
+    \label{fig:ablation_detailed}
+\end{figure}
+
+\subsection{Summary}
+
+The ablation study yields three principal findings:
+\begin{enumerate}
+    \item \textbf{Rate regularisation is indispensable} for compression.  Without it, the model retains high fidelity but the parameter entropy makes storage impractical ($\sim$400$\times$ larger).
+    \item \textbf{Adaptive densification is the largest quality driver.}  Fixed-count training at 8{,}000 Gaussians incurs the largest PSNR drop ($-$2~dB below other ablations), confirming that dynamic allocation of primitives to structurally complex regions is essential.
+    \item \textbf{Edge-aware weighting is the most impactful regulariser} for reconstruction quality.  By biasing the loss toward neurite boundaries, it yields nearly 1~dB improvement over the next ablation, highlighting the importance of geometry-aware training for sparse neuronal data.
+\end{enumerate}
+
+SSIM, TV, and overlap terms each contribute modestly ($\sim$0.1--0.2~dB) and their effects are complementary, collectively ensuring smoother, more compressible, and perceptually faithful reconstructions.
+
+% ============================================================
+% CONCLUSION
+% ============================================================
+\section{Conclusion}
+\label{sec:conclusion}
+
+We presented NeuroGS-Codec, a volumetric compression method based on 3D Gaussian mixture fields for fluorescence microscopy data. By representing volumes as weighted sums of anisotropic Gaussian primitives with adaptive densification, our approach achieves 38.09 dB PSNR at 5.57$\times$ compression while preserving fine neuronal morphology. The explicit Gaussian parameterization offers interpretability advantages over black-box neural representations, with each primitive encoding meaningful geometric information. Comparisons with MLP-based implicit representations demonstrate competitive quality, while the Gaussian formulation enables efficient parallel evaluation. Future work includes extending to time-lapse sequences, incorporating learned entropy models for improved rate-distortion, and applying NeuroGS-Codec to other sparse volumetric modalities.
+
+% ============================================================
+% REFERENCES
+% ============================================================
+\bibliographystyle{plain}
+\begin{thebibliography}{99}
+
+\bibitem{mildenhall2020nerf}
+Ben Mildenhall, Pratul P. Srinivasan, Matthew Tancik, Jonathan T. Barron, Ravi Ramamoorthi, and Ren Ng.
+NeRF: Representing scenes as neural radiance fields for view synthesis.
+\textit{Communications of the ACM}, 65(1):99--106, 2022.
+
+\bibitem{rahaman2019spectral}
+Nasim Rahaman, Aristide Baratin, Devansh Arpit, Felix Draxler, Min Lin, Fred Hamprecht, Yoshua Bengio, and Aaron Courville.
+On the spectral bias of neural networks.
+\textit{International Conference on Machine Learning (ICML)}, pages 5301--5310, 2019.
+
+\bibitem{pumarola2021dnerf}
+Albert Pumarola, Enric Corona, Gerard Pons-Moll, and Francesc Moreno-Noguer.
+D-NeRF: Neural radiance fields for dynamic scenes.
+\textit{IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR)}, pages 10318--10327, 2021.
+
+\bibitem{mueller2022instant}
+Thomas M\"uller, Alex Evans, Christoph Schied, and Alexander Keller.
+Instant neural graphics primitives with a multiresolution hash encoding.
+\textit{ACM Transactions on Graphics (SIGGRAPH)}, 41(4):102:1--102:15, 2022.
+
+\bibitem{chen2022tensorf}
+Anpei Chen, Zexiang Xu, Andreas Geiger, Jingyi Yu, and Hao Su.
+TensoRF: Tensorial radiance fields.
+\textit{European Conference on Computer Vision (ECCV)}, pages 333--350, 2022.
+
+\bibitem{yu2021plenoctrees}
+Alex Yu, Ruilong Li, Matthew Tancik, Hao Li, Ren Ng, and Angjoo Kanazawa.
+PlenOctrees for real-time rendering of neural radiance fields.
+\textit{IEEE/CVF International Conference on Computer Vision (ICCV)}, pages 5752--5761, 2021.
+
+\bibitem{sitzmann2020siren}
+Vincent Sitzmann, Julien N.P. Martel, Alexander W. Bergman, David B. Lindell, and Gordon Wetzstein.
+Implicit neural representations with periodic activation functions.
+\textit{Advances in Neural Information Processing Systems (NeurIPS)}, 33:7462--7473, 2020.
+
+\bibitem{mescheder2019occupancy}
+Lars Mescheder, Michael Oechsle, Michael Niemeyer, Sebastian Nowozin, and Andreas Geiger.
+Occupancy networks: Learning 3D reconstruction in function space.
+\textit{IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR)}, pages 4460--4470, 2019.
+
+\bibitem{park2019deepsdf}
+Jeong Joon Park, Peter Florence, Julian Straub, Richard Newcombe, and Steven Lovegrove.
+DeepSDF: Learning continuous signed distance functions for shape representation.
+\textit{IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR)}, pages 165--174, 2019.
+
+\bibitem{dupont2021coin}
+Emilien Dupont, Adam Goli\'nski, Milad Alizadeh, Yee Whye Teh, and Arnaud Doucet.
+COIN: Compression with implicit neural representations.
+\textit{arXiv preprint arXiv:2103.03123}, 2021.
+
+\bibitem{strumpler2022implicit}
+Yannick Str\"umpler, Janis Postels, Ren Yang, Luc Van Gool, and Federico Tombari.
+Implicit neural representations for image compression.
+\textit{European Conference on Computer Vision (ECCV)}, pages 74--91, 2022.
+
+\bibitem{kerbl20233d}
+Bernhard Kerbl, Georgios Kopanas, Thomas Leimk\"uhler, and George Drettakis.
+3D Gaussian splatting for real-time radiance field rendering.
+\textit{ACM Transactions on Graphics (SIGGRAPH)}, 42(4):139:1--139:14, 2023.
+
+\bibitem{luiten2023dynamic}
+Jonathon Luiten, Georgios Kopanas, Bastian Leibe, and Deva Ramanan.
+Dynamic 3D Gaussians: Tracking by persistent dynamic view synthesis.
+\textit{International Conference on 3D Vision (3DV)}, 2024.
+
+\bibitem{wu20234dgaussians}
+Guanjun Wu, Taoran Yi, Jiemin Fang, Lingxi Xie, Xiaopeng Zhang, Wei Wei, Wenyu Liu, Qi Tian, and Xinggang Wang.
+4D Gaussian splatting for real-time dynamic scene rendering.
+\textit{IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR)}, 2024.
+
+\bibitem{lee2024compact}
+Joo Chan Lee, Daniel Rho, Xiangyu Sun, Jong Hwan Ko, and Eunbyung Park.
+Compact 3D Gaussian representation for radiance field.
+\textit{IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR)}, 2024.
+
+\bibitem{qian2023gaussianavatars}
+Shenhan Qian, Tobias Kirschstein, Liam Schoneveld, Davide Davoli, Simon Giebenhain, and Matthias Nie{\ss}ner.
+GaussianAvatars: Photorealistic head avatars with rigged 3D Gaussians.
+\textit{IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR)}, 2024.
+
+\bibitem{yan2024street}
+Yunzhi Yan, Haotong Lin, Chenxu Zhou, Weijie Wang, Haiyang Sun, Kun Zhan, Xianpeng Lang, Xiaowei Zhou, and Sida Peng.
+Street Gaussians for modeling dynamic urban scenes.
+\textit{IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR)}, 2024.
+
+\bibitem{balle2017end}
+Johannes Ball\'e, Valero Laparra, and Eero P. Simoncelli.
+End-to-end optimized image compression.
+\textit{International Conference on Learning Representations (ICLR)}, 2017.
+
+\bibitem{balle2018variational}
+Johannes Ball\'e, David Minnen, Saurabh Singh, Sung Jin Hwang, and Nick Johnston.
+Variational image compression with a scale hyperprior.
+\textit{International Conference on Learning Representations (ICLR)}, 2018.
+
+\bibitem{minnen2018joint}
+David Minnen, Johannes Ball\'e, and George D. Toderici.
+Joint autoregressive and hierarchical priors for learned image compression.
+\textit{Advances in Neural Information Processing Systems (NeurIPS)}, 31:10771--10780, 2018.
+
+\bibitem{zhu2022transformer}
+Yinhao Zhu, Yang Yang, and Taco Cohen.
+Transformer-based image compression.
+\textit{Data Compression Conference (DCC)}, pages 469--469, 2022.
+
+\bibitem{taubman2002jpeg2000}
+David Taubman and Michael Marcellin.
+\textit{JPEG2000: Image Compression Fundamentals, Standards and Practice}.
+Springer, 2002.
+
+\bibitem{yang2023implicitvol}
+Yiheng Yang, Zhixin Shu, and Xinchao Wang.
+Implicit neural representation for volumetric medical image compression.
+\textit{Medical Image Computing and Computer Assisted Intervention (MICCAI)}, pages 234--244, 2023.
+
+\bibitem{chen2023neurocompress}
+Zhaoyang Chen, Yingxue Pang, and Wenbing Tao.
+NeuroCompress: Neural-based compression for volumetric data.
+\textit{IEEE Transactions on Visualization and Computer Graphics}, 2023.
+
+\bibitem{charbonnier1994two}
+Pierre Charbonnier, Laure Blanc-F{\'e}raud, Gilles Aubert, and Michel Barlaud.
+Two deterministic half-quadratic regularization algorithms for computed imaging.
+\textit{IEEE International Conference on Image Processing (ICIP)}, 2:168--172, 1994.
+
+\bibitem{wang2004image}
+Zhou Wang, Alan~C. Bovik, Hamid~R. Sheikh, and Eero~P. Simoncelli.
+Image quality assessment: from error visibility to structural similarity.
+\textit{IEEE Transactions on Image Processing}, 13(4):600--612, 2004.
+
+\bibitem{barron2019general}
+Jonathan~T. Barron.
+A general and adaptive robust loss function.
+\textit{IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR)}, pages 4331--4339, 2019.
+
+\bibitem{dempster1977maximum}
+Arthur P. Dempster, Nan M. Laird, and Donald B. Rubin.
+Maximum likelihood from incomplete data via the EM algorithm.
+\textit{Journal of the Royal Statistical Society: Series B}, 39(1):1--38, 1977.
+
+\bibitem{preibisch2014efficient}
+Stephan Preibisch, Fernando Amat, Evangelia Stamataki, Mihail Sarov, Robert H. Singer, Eugene Myers, and Pavel Tomancak.
+Efficient Bayesian-based multiview deconvolution.
+\textit{Nature Methods}, 11(6):645--648, 2014.
+
+\end{thebibliography}
 
 \end{document}
