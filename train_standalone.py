@@ -25,6 +25,21 @@ import torch.nn.functional as F
 import tifffile as tiff
 from tqdm.auto import tqdm
 
+# Performance: enable cudnn benchmarking for fastest convolutions
+torch.backends.cudnn.benchmark = True
+
+# Load CUDA kernels for accelerated Gaussian splatting
+try:
+    from cuda_ops import CUDAGaussianMixtureVolume, CUDA_AVAILABLE
+    USE_CUDA_OPS = CUDA_AVAILABLE
+except ImportError:
+    USE_CUDA_OPS = False
+
+if USE_CUDA_OPS:
+    print("[CUDA] Custom CUDA kernels loaded – using accelerated forward pass")
+else:
+    print("[CUDA] Custom kernels not available – using PyTorch fallback")
+
 # ============================================================================
 # Configuration
 # ============================================================================
@@ -38,7 +53,7 @@ TRAINING_CONFIG = {
     # init / steps
     "N0": 8000,
     "steps": 50000,           # INCREASED (was 35000)
-    "batch": 4000,            # REDUCED to avoid OOM (was 8000)
+    "batch": 8000,            # INCREASED for better GPU utilization
     "kappa": 15.0,            # INCREASED (was 10.0)
 
     # rate-distortion
@@ -191,16 +206,33 @@ class GaussianMixtureVolume(nn.Module):
         return self.mu - r, self.mu + r
 
     def _forward_dense(self, x: torch.Tensor) -> torch.Tensor:
-        dx = x[:, None, :] - self.mu[None, :, :]           # (P,N,3)
+        # Precompute per-Gaussian quantities once
         s = torch.exp(self.log_s).clamp(1e-4, 10.0)         # (N,3)
+        inv_s = 1.0 / (s + 1e-8)                            # (N,3)
         qn = safe_normalize(self.q)                         # (N,4)
         Rt = quat_to_rotmat(qn).transpose(-1, -2)           # (N,3,3)
 
-        y = torch.einsum("pni,nij->pnj", dx, Rt)
-        y = y / (s[None, :, :] + 1e-8)
+        P = x.shape[0]
+        N = self.N
+        CHUNK = 4096  # Process points in chunks to limit memory
 
-        g = torch.exp(-0.5 * (y * y).sum(dim=-1))          # (P,N)
-        return (g * self.a[None, :]).sum(dim=1) + self.b   # (P,)
+        if P * N <= 50_000_000:  # Small enough: dense matmul
+            dx = x[:, None, :] - self.mu[None, :, :]        # (P,N,3)
+            y = torch.einsum("pni,nij->pnj", dx, Rt)
+            y = y * inv_s[None, :, :]                       # avoid division
+            g = torch.exp(-0.5 * (y * y).sum(dim=-1))       # (P,N)
+            return (g * self.a[None, :]).sum(dim=1) + self.b
+
+        # Chunked processing for large P*N
+        out = torch.empty(P, device=x.device, dtype=x.dtype)
+        for i in range(0, P, CHUNK):
+            xc = x[i:i+CHUNK]                               # (C,3)
+            dx = xc[:, None, :] - self.mu[None, :, :]        # (C,N,3)
+            y = torch.einsum("pni,nij->pnj", dx, Rt)
+            y = y * inv_s[None, :, :]
+            g = torch.exp(-0.5 * (y * y).sum(dim=-1))
+            out[i:i+CHUNK] = (g * self.a[None, :]).sum(dim=1) + self.b
+        return out
 
     def forward(self, x: torch.Tensor, use_culling: bool = True, max_gaussians_per_tile: int = 50000) -> torch.Tensor:
         if self.N == 0:
@@ -382,7 +414,7 @@ def field_grad_smoothness(model, pts, n_sub=512):
     g = torch.autograd.grad(pred.sum(), pts, create_graph=True)[0]
     return (g.pow(2).sum(dim=-1)).mean()
 
-def overlap_loss_mahalanobis(model, n_pairs=2048, eps=1e-4):
+def overlap_loss_mahalanobis(model, n_pairs=1024, eps=1e-4):  # reduced from 2048
     N = model.N
     if N < 2:
         return torch.zeros((), device=model.b.device)
@@ -417,7 +449,27 @@ def overlap_loss_mahalanobis(model, n_pairs=2048, eps=1e-4):
 # ============================================================================
 
 @torch.no_grad()
-def sample_points(coords_grid, V, M, n_uniform, n_biased):
+def precompute_sampling_cdf(M):
+    """Precompute CDF for fast importance sampling (replaces torch.multinomial)."""
+    flatM = M.reshape(-1)
+    total = flatM.numel()
+    max_categories = 2**24 - 1
+    if total > max_categories:
+        # Subsample candidates
+        cand = torch.randint(0, total, (max_categories,), device=M.device)
+        probs = flatM[cand]
+        probs = probs / (probs.sum() + 1e-8)
+        cdf = torch.cumsum(probs, dim=0)
+        cdf[-1] = 1.0  # ensure exact 1.0
+        return cdf, cand
+    else:
+        probs = flatM / (flatM.sum() + 1e-8)
+        cdf = torch.cumsum(probs, dim=0)
+        cdf[-1] = 1.0
+        return cdf, None
+
+@torch.no_grad()
+def sample_points(coords_grid, V, M, n_uniform, n_biased, cdf=None, cdf_cand=None):
     Z, Y, X, _ = coords_grid.shape
     total = Z * Y * X
 
@@ -426,17 +478,28 @@ def sample_points(coords_grid, V, M, n_uniform, n_biased):
     yu = (idx_u % (Y * X)) // X
     xu = idx_u % X
 
-    flatM = M.reshape(-1)
-    max_categories = 2**24 - 1
-    if total > max_categories:
-        cand = torch.randint(0, total, (max_categories,), device=V.device)
-        probs = flatM[cand]
-        probs = probs / (probs.sum() + 1e-8)
-        sel = torch.multinomial(probs, n_biased, replacement=True)
-        idx_b = cand[sel]
+    # Fast importance sampling using precomputed CDF + searchsorted
+    if cdf is not None:
+        rand_vals = torch.rand(n_biased, device=V.device)
+        idx_in_cdf = torch.searchsorted(cdf, rand_vals)
+        idx_in_cdf = idx_in_cdf.clamp(0, cdf.numel() - 1)
+        if cdf_cand is not None:
+            idx_b = cdf_cand[idx_in_cdf]
+        else:
+            idx_b = idx_in_cdf
     else:
-        probs = flatM / (flatM.sum() + 1e-8)
-        idx_b = torch.multinomial(probs, n_biased, replacement=True)
+        # Fallback to multinomial
+        flatM = M.reshape(-1)
+        max_categories = 2**24 - 1
+        if total > max_categories:
+            cand = torch.randint(0, total, (max_categories,), device=V.device)
+            probs = flatM[cand]
+            probs = probs / (probs.sum() + 1e-8)
+            sel = torch.multinomial(probs, n_biased, replacement=True)
+            idx_b = cand[sel]
+        else:
+            probs = flatM / (flatM.sum() + 1e-8)
+            idx_b = torch.multinomial(probs, n_biased, replacement=True)
 
     zb = idx_b // (Y * X)
     yb = (idx_b % (Y * X)) // X
@@ -857,6 +920,10 @@ def train(model, V, coords_grid, M, H_mu, H_logs, H_q, H_a, H_b, Q, cfg):
     print(f"Prune every: {cfg.get('prune_every')} iters")
     print("="*70 + "\n")
 
+    # Precompute sampling CDF for fast importance sampling
+    sampling_cdf, sampling_cand = precompute_sampling_cdf(M)
+    print(f"Precomputed sampling CDF ({sampling_cdf.numel()} entries)")
+
     for it in tqdm(range(steps), desc="Training"):
         current_lr = lr - (lr - lr_final) * (it / max(steps - 1, 1))
         for pg in opt.param_groups:
@@ -864,7 +931,8 @@ def train(model, V, coords_grid, M, H_mu, H_logs, H_q, H_a, H_b, Q, cfg):
 
         n_u = cfg["batch"] // 2
         n_b = cfg["batch"] - n_u
-        pts, tgt, mval = sample_points(coords_grid, V, M, n_u, n_b)
+        pts, tgt, mval = sample_points(coords_grid, V, M, n_u, n_b, 
+                                        cdf=sampling_cdf, cdf_cand=sampling_cand)
 
         with torch.amp.autocast(device_type="cuda", enabled=use_amp):
             pred = model(pts)
@@ -886,30 +954,35 @@ def train(model, V, coords_grid, M, H_mu, H_logs, H_q, H_a, H_b, Q, cfg):
                        H_q.total_bits(q_q) + H_a.total_bits(a_q) + H_b.total_bits(b_q))
 
             T = torch.zeros((), device=V.device)
-            if (it % 20) == 0:
+            if (it % 100) == 0:  # was 20 — reduced frequency for speed
                 T = patch_topology_loss(model, coords_grid, V, patch_zyx=cfg["topo_patch"])
-                last_T = float(T.detach().cpu())
+                last_T = float(T.detach())
 
             TV = torch.zeros((), device=V.device)
-            if cfg["beta_tv"] > 0 and (it % 10) == 0:
+            if cfg["beta_tv"] > 0 and (it % 50) == 0:  # was 10
                 TV = reconstruction_tv_loss(model, coords_grid, patch_zyx=cfg["topo_patch"])
 
             SSIM_loss = torch.zeros((), device=V.device)
-            if cfg["beta_ssim"] > 0 and (it % 5) == 0:
+            if cfg["beta_ssim"] > 0 and (it % 25) == 0:  # was 5
                 SSIM_loss = patch_ssim_loss(model, coords_grid, V, patch_zyx=cfg["topo_patch"])
-                last_SSIM = float(SSIM_loss.detach().cpu())
+                last_SSIM = float(SSIM_loss.detach())
 
             Edge_loss = torch.zeros((), device=V.device)
-            if cfg["beta_edge"] > 0 and (it % 5) == 0:
+            if cfg["beta_edge"] > 0 and (it % 25) == 0:  # was 5
                 Edge_loss = edge_aware_loss(model, coords_grid, V, M, patch_zyx=cfg["topo_patch"])
 
             G = torch.zeros((), device=V.device)
-            if cfg.get("beta_grad", 0.0) > 0 and (it % 10) == 0:
-                G = field_grad_smoothness(model, pts, n_sub=512)
+            if cfg.get("beta_grad", 0.0) > 0 and (it % 50) == 0:  # was 10
+                G = field_grad_smoothness(model, pts, n_sub=256)  # was 512
 
-            Sm = smoothness_loss(model)
-            S = sparsity_loss(model)
-            O = overlap_loss_mahalanobis(model, n_pairs=2048)
+            Sm = torch.zeros((), device=V.device)
+            S = torch.zeros((), device=V.device)
+            O = torch.zeros((), device=V.device)
+            if (it % 5) == 0:  # every 5 iters instead of every iter
+                Sm = smoothness_loss(model)
+                S = sparsity_loss(model)
+            if (it % 10) == 0:  # overlap every 10 iters (was every iter)
+                O = overlap_loss_mahalanobis(model)
 
             total = (
                 D +
@@ -919,9 +992,9 @@ def train(model, V, coords_grid, M, H_mu, H_logs, H_q, H_a, H_b, Q, cfg):
                 cfg["beta_ssim"] * SSIM_loss +
                 cfg["beta_edge"] * Edge_loss +
                 cfg.get("beta_grad", 0.0) * G +
-                cfg["beta_sparse"] * S +
-                cfg["beta_smooth"] * Sm +
-                cfg["beta_overlap"] * O
+                cfg["beta_sparse"] * (S * 5) +      # scale up 5x to compensate every-5 freq
+                cfg["beta_smooth"] * (Sm * 5) +      # scale up 5x to compensate every-5 freq
+                cfg["beta_overlap"] * (O * 10)        # scale up 10x to compensate every-10 freq
             )
 
         opt.zero_grad(set_to_none=True)
@@ -933,23 +1006,24 @@ def train(model, V, coords_grid, M, H_mu, H_logs, H_q, H_a, H_b, Q, cfg):
         scaler.step(opt)
         scaler.update()
 
-        # logging
-        losses["D"].append(float(D.detach().cpu()))
-        losses["R"].append(float(R.detach().cpu()))
-        total_bits = float(R_total.detach().cpu())
-        losses["R_total_bits"].append(total_bits)
-        bits_per_g = total_bits / max(model.N, 1)
-        losses["R_bits_per_gaussian"].append(bits_per_g)
-        losses["T"].append(float(T.detach().cpu()))
-        losses["G"].append(float(G.detach().cpu()))
-        losses["TV"].append(float(TV.detach().cpu()))
-        losses["SSIM"].append(float(SSIM_loss.detach().cpu()))
-        losses["Edge"].append(float(Edge_loss.detach().cpu()))
-        losses["S"].append(float(S.detach().cpu()))
-        losses["Sm"].append(float(Sm.detach().cpu()))
-        losses["O"].append(float(O.detach().cpu()))
-        losses["Total"].append(float(total.detach().cpu()))
-        losses["N"].append(model.N)
+        # logging — only log every 10 iters to reduce CPU sync overhead
+        if (it % 10) == 0 or it == steps - 1:
+            losses["D"].append(float(D.detach()))
+            losses["R"].append(float(R.detach()))
+            total_bits = float(R_total.detach())
+            losses["R_total_bits"].append(total_bits)
+            bits_per_g = total_bits / max(model.N, 1)
+            losses["R_bits_per_gaussian"].append(bits_per_g)
+            losses["T"].append(float(T.detach()))
+            losses["G"].append(float(G.detach()))
+            losses["TV"].append(float(TV.detach()))
+            losses["SSIM"].append(float(SSIM_loss.detach()))
+            losses["Edge"].append(float(Edge_loss.detach()))
+            losses["S"].append(float(S.detach()))
+            losses["Sm"].append(float(Sm.detach()))
+            losses["O"].append(float(O.detach()))
+            losses["Total"].append(float(total.detach()))
+            losses["N"].append(model.N)
 
         # densify (every densify_every)
         if cfg["densify_enabled"] and controller is not None:
@@ -992,16 +1066,15 @@ def train(model, V, coords_grid, M, H_mu, H_logs, H_q, H_a, H_b, Q, cfg):
                     f"| should_prune={should_prune}\n"
                 )
 
-        if (it + 1) % 200 == 0:
+        if (it + 1) % 500 == 0:  # was 200 — less printing overhead
             dt = time.time() - t0
-            recent = sum(losses["Total"][-200:]) / min(200, len(losses["Total"]))
-            avg = sum(losses["Total"]) / len(losses["Total"])
-            total_kb = losses["R_total_bits"][-1] / 8 / 1024
-            bpg = losses["R_bits_per_gaussian"][-1]
+            iters_per_sec = (it + 1) / dt
+            total_kb = losses["R_total_bits"][-1] / 8 / 1024 if losses["R_total_bits"] else 0
+            bpg = losses["R_bits_per_gaussian"][-1] if losses["R_bits_per_gaussian"] else 0
             print(f"iter {it+1:5d} | D={losses['D'][-1]:.5f} R={losses['R'][-1]:.2f} "
                   f"T={last_T:.4f} SSIM={last_SSIM:.4f} | "
                   f"Loss={losses['Total'][-1]:.4f} | "
-                  f"N={model.N} | {total_kb:.1f}KB ({bpg:.1f} bits/G) | {dt:.1f}s")
+                  f"N={model.N} | {total_kb:.1f}KB ({bpg:.1f} bits/G) | {dt:.0f}s ({iters_per_sec:.1f} it/s)")
 
         if cfg.get("save_every") and (it + 1) % cfg["save_every"] == 0:
             save_checkpoint(
@@ -1011,7 +1084,7 @@ def train(model, V, coords_grid, M, H_mu, H_logs, H_q, H_a, H_b, Q, cfg):
                 iteration=it+1
             )
 
-        if (it + 1) % 500 == 0:
+        if (it + 1) % 2000 == 0:  # was 500 — less frequent GC
             gc.collect()
             torch.cuda.empty_cache()
 
@@ -1039,7 +1112,13 @@ def main():
 
     N0 = TRAINING_CONFIG["N0"]
     init_means, init_amp = init_gaussians_from_neurite_map(coords_grid, V_t, M, N0)
-    model = GaussianMixtureVolume(N0, init_means, init_amp).to(DEVICE)
+    
+    if USE_CUDA_OPS:
+        model = CUDAGaussianMixtureVolume(N0, init_means, init_amp).to(DEVICE)
+        print(f"[CUDA] Using CUDAGaussianMixtureVolume with {N0} Gaussians")
+    else:
+        model = GaussianMixtureVolume(N0, init_means, init_amp).to(DEVICE)
+    
     model.log_s.data.fill_(-3.0)
 
     H_mu = LaplaceEntropyModel(init_scale=0.2).to(DEVICE)

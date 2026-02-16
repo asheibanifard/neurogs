@@ -1,0 +1,15 @@
+# NeuroGS Training Dependencies
+# ===============================
+
+# Core dependencies
+torch>=2.0.0
+numpy>=1.20.0
+tifffile>=2021.0.0
+tqdm>=4.60.0
+
+# Optional but recommended
+matplotlib>=3.3.0
+scipy>=1.7.0
+
+# CUDA extension build dependencies (optional)
+# ninja  # Uncomment if building CUDA kernels from source
