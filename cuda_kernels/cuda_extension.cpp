@@ -48,6 +48,14 @@ extern "C" {
         const int N,
         cudaStream_t stream
     );
+    
+    void launch_compute_mse(
+        const float* pred,
+        const float* target,
+        float* output,
+        const int N,
+        cudaStream_t stream
+    );
 }
 
 // ============================================================================
@@ -258,6 +266,44 @@ torch::Tensor gaussian_splatting_forward_autograd(
 
 
 // ============================================================================
+// Fast MSE Computation
+// ============================================================================
+
+torch::Tensor compute_mse_cuda(
+    torch::Tensor pred,
+    torch::Tensor target
+) {
+    TORCH_CHECK(pred.is_cuda(), "pred must be a CUDA tensor");
+    TORCH_CHECK(target.is_cuda(), "target must be a CUDA tensor");
+    TORCH_CHECK(pred.dtype() == torch::kFloat32, "pred must be float32");
+    TORCH_CHECK(target.dtype() == torch::kFloat32, "target must be float32");
+    
+    const int N = pred.numel();
+    TORCH_CHECK(target.numel() == N, "target must have same size as pred");
+    
+    // Ensure contiguous
+    pred = pred.contiguous().view({-1});
+    target = target.contiguous().view({-1});
+    
+    // Allocate output (single scalar)
+    auto output = torch::zeros({1}, torch::TensorOptions()
+        .dtype(torch::kFloat32)
+        .device(pred.device()));
+    
+    auto stream = c10::cuda::getCurrentCUDAStream(pred.device().index());
+    launch_compute_mse(
+        pred.data_ptr<float>(),
+        target.data_ptr<float>(),
+        output.data_ptr<float>(),
+        N,
+        stream.stream()
+    );
+    
+    return output / static_cast<float>(N);
+}
+
+
+// ============================================================================
 // Python Module Definition
 // ============================================================================
 
@@ -285,6 +331,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("pred"),
           py::arg("target"),
           py::arg("weights"));
+    
+    m.def("compute_mse", &compute_mse_cuda,
+          "Fast MSE computation (CUDA)",
+          py::arg("pred"),
+          py::arg("target"));
     
     m.def("gaussian_splatting_backward", &gaussian_splatting_backward_cuda,
           "Gaussian splatting backward pass (CUDA)",

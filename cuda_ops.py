@@ -151,6 +151,27 @@ def cuda_weighted_charbonnier_loss(pred, target, weights, eps=1e-3):
         return (weights * torch.sqrt(diff * diff + eps * eps)).mean()
 
 
+def cuda_compute_mse(pred, target):
+    """
+    Fast MSE computation using CUDA kernel with block-level reduction
+    
+    Args:
+        pred: [...] predictions (any shape)
+        target: [...] targets (same shape as pred)
+    
+    Returns:
+        Scalar MSE value (mean squared error)
+    """
+    if CUDA_AVAILABLE and pred.is_cuda:
+        return neurogs_cuda.compute_mse(
+            pred.contiguous().view(-1),
+            target.contiguous().view(-1)
+        )
+    else:
+        # PyTorch fallback
+        return ((pred - target) ** 2).mean()
+
+
 # ============================================================================
 # Enhanced Gaussian Model with CUDA Support
 # ============================================================================
