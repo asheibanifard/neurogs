@@ -1,0 +1,49 @@
+# Quick profiling config - just 100 steps to see timing breakdown
+data:
+  tif_path: "10-2900-control-cell-05_cropped_corrected.tif"
+
+seed: 42
+
+model:
+  num_gaussians: 2000           # Reduced from 5000 for profiling
+  init_scale: 0.02
+  bounds: [[-1,1],[-1,1],[-1,1]]
+
+training:
+  device: auto
+  log_dir: logs
+  save_path: "checkpoints/gmf_profile.pt"
+  
+  mixed_precision: true
+  
+  mode: progressive
+  progressive_phase1_mode: volume
+  progressive_phase1_steps: 50        # Just 50 volume steps
+  progressive_phase2_mode: hybrid
+  progressive_phase2_steps: 50        # Just 50 hybrid steps
+  
+  steps: 100  # Will be overridden by progressive mode
+  learning_rate: 5.0e-3
+  log_every: 25
+
+  vol_points_per_step: 4096     # Reduced from 8192
+  vol_intensity_weighted: true
+
+  mip_pixels_per_step: 1024    # Reduced from 4096 for profiling
+  mip_z_samples: 48             # Reduced from 96 for profiling
+
+  tau_start: 0.08
+  tau_end: 0.02
+
+  lambda_tube: 1e-4
+  lambda_cross: 1e-4
+
+  w_vol: 1.0
+  w_mip: 1.0
+
+  weight_schedule: 'step'
+  w_vol_start: 1.0
+  w_vol_end: 1.0
+  w_mip_start: 0.2
+  w_mip_end: 1.0
+  weight_transition_fraction: 0.3

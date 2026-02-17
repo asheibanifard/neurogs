@@ -1,0 +1,231 @@
+# Configuration file for NeuroGS v7
+# 
+# PERFORMANCE NOTE:
+# MIP rendering is ~48x more expensive than volume fitting because it evaluates
+# the field at mip_pixels_per_step × mip_z_samples points (default 4096 × 96 = 393K)
+# vs just 8K points for volume mode. With K=5000 Gaussians, that's 2 billion evals/step.
+#
+# QUICK OPTIMIZATION (if training is too slow):
+#   1. Enable mixed_precision: true (2x speedup)
+#   2. Reduce mip_z_samples: 96 → 64 (33% faster MIP)
+#   3. Reduce mip_pixels_per_step: 4096 → 2048 (2x faster MIP)
+#   4. Reduce num_gaussians: 5000 → 2000 (2.5x overall speedup)
+#   5. Use progressive training (volume first, then MIP)
+#
+# See PERFORMANCE_ANALYSIS.md for detailed profiling and recommendations.
+# 
+# TRAINING STRATEGIES:
+# 
+# 1. VOLUME MODE: Fit 3D volume only
+#    - Best for: ensuring accurate 3D reconstruction
+#    - Use when: you need guaranteed volume fidelity
+#    - Limitation: MIP quality not explicitly optimized
+# 
+# 2. MIP MODE: Fit MIP projection only
+#    - Best for: directly optimizing visualization quality
+#    - Use when: MIP rendering is your primary goal
+#    - Limitation: 3D volume may not be accurate (can "cheat" for MIP)
+# 
+# 3. HYBRID MODE: Fit both volume and MIP simultaneously
+#    - Best for: balanced 3D accuracy + MIP quality
+#    - Use when: you need both good reconstruction and sharp MIPs
+#    - Key: L_total = w_vol*L_vol + w_mip*L_mip + regularizers
+#    - Recommended: Use weight scheduling (start w_mip low, increase later)
+# 
+# 4. PROGRESSIVE MODE: Volume first, then hybrid/MIP
+#    - Best for: stable training with excellent final quality
+#    - Use when: you want to establish 3D structure before sharpening MIP
+#    - Strategy: 500-2000 steps volume → remaining steps hybrid
+#    - This is the recommended approach for most use cases
+
+# Data Configuration
+data:
+  tif_path: "10-2900-control-cell-05_cropped_corrected.tif"
+
+# Global Configuration
+seed: 0  # Random seed for reproducibility (0 = no seed set)
+
+# Model Configuration
+model:
+  num_gaussians: 5000       # Reduce to 500-2000 if too slow (forward is O(N*K))
+  init_scale: 0.02
+  bounds: [[-1,1],[-1,1],[-1,1]]
+
+# Training Configuration
+training:
+  device: auto
+  log_dir: logs
+  save_path: "checkpoints/gmf.pt"
+  
+  # Performance optimization
+  mixed_precision: true    # Enable for ~2x speedup on CUDA (recommended for large models)
+  
+  # Training mode options:
+  # - volume: fit 3D volume only
+  # - mip: fit MIP projection only
+  # - hybrid: fit both volume and MIP simultaneously
+  # - progressive: start with volume, then switch to hybrid/mip for sharpening
+  mode: progressive     # volume | mip | hybrid | progressive
+  
+  # Progressive mode settings (only used when mode=progressive)
+  # Strategy: Start with volume for geometric structure, then switch to hybrid/mip for MIP sharpening
+  progressive_phase1_mode: volume     # First phase: volume reconstruction
+  progressive_phase1_steps: 500       # Duration: 500-2000 steps recommended
+  progressive_phase2_mode: hybrid     # Second phase: hybrid or mip for sharpening
+  progressive_phase2_steps: 1500      # Fine-tuning duration
+  
+  # Total steps (ignored in progressive mode - uses phase1_steps + phase2_steps instead)
+  steps: 2000
+  learning_rate:  5.0e-3
+  log_every: 50
+
+  vol_points_per_step: 8192
+  vol_intensity_weighted: true
+
+  mip_pixels_per_step: 4096
+  mip_z_samples: 96            # Reduce to 64-96 if too slow (O(N*K) per z-sample)
+  tau_start: 0.08
+  tau_end: 0.02
+
+  # Loss weights for hybrid mode
+  # In hybrid mode: L_total = w_vol*L_vol + w_mip*L_mip + λ_tube*L_tube + λ_cross*L_cross
+  # - L_vol: 3D volume reconstruction fidelity
+  # - L_mip: 2D MIP projection fidelity
+  # - L_tube: tubular shape regularization (encourages elongated Gaussians)
+  # - L_cross: cross-section symmetry (cylindrical vs flat ribbons)
+  w_vol: 1.0
+  w_mip: 1.0
+  lambda_tube: 1.0e-4
+  lambda_cross: 1.0e-4
+
+  # Weight scheduling (applies whenever MIP loss is active)
+  # Strategy: Start with more weight on volume, gradually increase MIP weight
+  # This prevents the model from sacrificing volume accuracy for MIP sharpness
+  # 
+  # Note: Scheduling is computed over total training steps but only affects
+  # steps where MIP loss is active (hybrid/mip modes, or phase2 in progressive)
+  # 
+  # Options: 'constant', 'step', 'linear_ramp'
+  weight_schedule: 'step'  # constant | step | linear_ramp
+  
+  # Schedule behaviors:
+  # - 'constant': w_vol and w_mip stay fixed throughout training
+  # - 'step': abrupt switch at transition_fraction (e.g., 30%)
+  #     - Before 30%: w_vol=w_vol_start, w_mip=w_mip_start
+  #     - After 30%: w_vol=w_vol_end, w_mip=w_mip_end
+  # - 'linear_ramp': warmup then gradual ramp
+  #     - Before 30%: w_vol=w_vol_start, w_mip=w_mip_start (warmup)
+  #     - After 30%: linearly interpolate to w_vol_end, w_mip_end
+  #
+  # Recommended: 'step' for simplicity, 'linear_ramp' for smoother transitions
+  #
+  # Example (progressive mode with step schedule, transition_fraction=0.3):
+  #   Total steps: 2000 (500 volume + 1500 hybrid)
+  #   Step 0-499: volume mode → MIP loss inactive, weights don't matter
+  #   Step 500-599: hybrid @ 25-30% progress → w_mip=0.2 (before transition)
+  #   Step 600-1999: hybrid @ 30-100% progress → w_mip=1.0 (after transition)
+  #   Result: ~100 steps of gentle hybrid warmup, then full MIP weight
+  
+  w_vol_start: 1.0
+  w_mip_start: 0.2
+  w_vol_end: 1.0
+  w_mip_end: 1.0
+  weight_transition_fraction: 0.3  # Warmup duration (before ramping begins)
+  
+  # Monitoring tips:
+  # - vol_rec should decrease (improving 3D fit)
+  # - mip_mip should decrease (improving MIP quality)
+  # - If MIP looks good but volume degrades: reduce w_mip_end or increase w_vol_end
+  # - If volume is great but MIP still foggy: increase w_mip_end or mip_z_samples
+
+# ============================================================================
+# RECOMMENDED CONFIGURATIONS FOR DIFFERENT SCENARIOS
+# ============================================================================
+#
+# SCENARIO 1: Small volume, fast iteration (< 512^3 voxels)
+# -----------------------------------------------------------
+# num_gaussians: 1000-2000
+# mip_z_samples: 64-96
+# mode: progressive
+# progressive_phase1_steps: 300
+# progressive_phase2_steps: 700
+# weight_schedule: 'step'
+# w_mip_start: 0.2, w_mip_end: 1.0
+#
+# SCENARIO 2: Medium volume, balanced quality/speed (512^3 voxels)
+# -----------------------------------------------------------
+# num_gaussians: 3000-5000
+# mip_z_samples: 96-128
+# mode: progressive
+# progressive_phase1_steps: 500
+# progressive_phase2_steps: 1500
+# weight_schedule: 'step'
+# w_mip_start: 0.2, w_mip_end: 1.0
+#
+# SCENARIO 3: Large volume, maximum quality (> 1024^3 voxels)
+# -----------------------------------------------------------
+# num_gaussians: 5000-10000
+# mip_z_samples: 128-192
+# mode: progressive
+# progressive_phase1_steps: 1000
+# progressive_phase2_steps: 3000
+# weight_schedule: 'linear_ramp'
+# w_mip_start: 0.1, w_mip_end: 1.5
+#
+# SCENARIO 4: MIP-only optimization (fastest)
+# -----------------------------------------------------------
+# num_gaussians: 2000-4000
+# mip_z_samples: 64-96
+# mode: mip
+# w_mip: 1.0
+# Note: Volume accuracy not guaranteed, but MIP will be optimal
+#
+# SCENARIO 5: Debugging / ensuring volume fidelity
+# -----------------------------------------------------------
+# num_gaussians: 3000-5000
+# mode: volume
+# w_vol: 1.0
+# Then run a second pass with mode: hybrid to add MIP sharpening
+#
+# ============================================================================
+# PERFORMANCE PRESETS (copy to main config for faster training)
+# ============================================================================
+#
+# FAST PROTOTYPING (10x speedup, 80% quality):
+# -----------------------------------------------------------
+# model:
+#   num_gaussians: 2000
+# training:
+#   steps: 500
+#   mip_z_samples: 48
+#   mip_pixels_per_step: 2048
+#   vol_points_per_step: 4096
+#   mixed_precision: true
+# progressive_training:
+#   enabled: true
+#   phase1_mode: "volume"
+#   phase1_steps: 250
+#   phase2_mode: "mip"
+#
+# BALANCED (3x speedup, 95% quality):
+# -----------------------------------------------------------
+# model:
+#   num_gaussians: 3000
+# training:
+#   steps: 1500
+#   mip_z_samples: 64
+#   mip_pixels_per_step: 3072
+#   mixed_precision: true
+# progressive_training:
+#   enabled: true
+#   phase1_mode: "volume"
+#   phase1_steps: 500
+#   phase2_mode: "hybrid"
+#
+# MAXIMUM QUALITY (current settings, slowest):
+# -----------------------------------------------------------
+# Already configured in main section above
+# Expected: 60-110 min for 2000 steps on RTX 3090/A100
+# With mixed_precision: 30-55 min
+#
+# ============================================================================
