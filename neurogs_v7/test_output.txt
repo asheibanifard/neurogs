@@ -1,0 +1,49 @@
+✓ Loaded custom CUDA extension for 2-3x faster backward pass
+Testing gradient flow in GaussianMixtureField
+============================================================
+
+============================================================
+Testing gradient flow with use_custom_autograd=False
+============================================================
+
+Parameter gradient checks:
+  means:         grad ✓ exists
+  log_scales:    grad ✓ exists
+  quaternions:   grad ✓ exists
+  log_amplitudes: grad ✓ exists
+
+Gradient magnitudes:
+  means:         0.002470
+  log_scales:    0.000412
+  quaternions:   0.000000
+  log_amplitudes: 0.000316
+
+✅ SUCCESS: All parameters have gradients!
+
+============================================================
+Testing gradient flow with use_custom_autograd=True
+============================================================
+✓ Using custom CUDA autograd for optimized backward pass
+
+Parameter gradient checks:
+  means:         grad ✓ exists
+  log_scales:    grad ✗ MISSING
+  quaternions:   grad ✗ MISSING
+  log_amplitudes: grad ✓ exists
+
+Gradient magnitudes:
+  means:         0.006758
+  log_scales:    ✗ None
+  quaternions:   ✗ None
+  log_amplitudes: 0.000721
+
+❌ FAILURE: Some parameters missing gradients!
+
+============================================================
+FINAL RESULTS:
+============================================================
+  Standard PyTorch:  ✅ PASS
+  Custom Autograd:   ❌ FAIL
+============================================================
+
+❌ Some tests failed! Check gradient computation.
