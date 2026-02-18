@@ -43,20 +43,19 @@ __global__ void gaussian_eval_forward_kernel(
 
 
 // ============================================================
-// Backward kernel: grad_x, grad_means, grad_amplitudes, grad_L_chol
+// OPTIMIZED Backward kernel: per-point with shared memory tiling
+// and warp-level reduction for K-parameter gradients.
 // ============================================================
-// Now also computes grad_L_chol, so the Python side doesn't need to
-// redo the expensive (N*K) solve_triangular.
 //
-// Per (n,k):
-//   grad_mahal = grad_out * val * (-0.5)
-//   grad_y_i   = grad_mahal * 2 * y_i
+// Key improvements over the original per-(n,k) kernel:
+//  1. One thread per point n, loops over K → eliminates atomicAdd on grad_x
+//  2. Gaussian params loaded into shared memory tiles → reduces global reads
+//  3. Warp-level __shfl_down_sync reduction → 32× fewer atomicAdds on K-params
+//  4. Early skip for negligible Gaussian contributions
 //
-// Gradient through forward substitution L y = d:
-//   grad_d via L^T solve (for grad_x, grad_means)
-//   grad_L_{ij} = -grad_y_i * y_j / L_{ii}  (lower-triangular entries only)
-//
-// grad_L_chol is accumulated per-Gaussian across all N points via atomicAdd.
+#define BACKWARD_TILE_K 32
+
+__launch_bounds__(256, 4)
 __global__ void gaussian_eval_backward_kernel(
     const float* __restrict__ grad_output,  // (N, K)
     const float* __restrict__ x,            // (N, 3)
@@ -67,107 +66,157 @@ __global__ void gaussian_eval_backward_kernel(
     float* __restrict__ grad_x,             // (N, 3)
     float* __restrict__ grad_means,         // (K, 3)
     float* __restrict__ grad_amplitudes,    // (K,)
-    float* __restrict__ grad_L,             // (K, 9)  — full 3x3 row-major, only lower-tri meaningful
+    float* __restrict__ grad_L,             // (K, 9)
     const int N,
     const int K
 ) {
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= N * K) return;
+    // Shared memory for Gaussian parameter tiles
+    __shared__ float s_means[BACKWARD_TILE_K * 3];   // (TILE, 3)
+    __shared__ float s_L[BACKWARD_TILE_K * 6];       // (TILE, 6) lower-tri: L00,L10,L11,L20,L21,L22
+    __shared__ float s_amp[BACKWARD_TILE_K];          // (TILE,)
 
-    const int n = idx / K;
-    const int k = idx % K;
+    const int n = blockIdx.x * blockDim.x + threadIdx.x;
+    const int lane = threadIdx.x & 31;
+    const bool valid = (n < N);
 
-    const float go = grad_output[idx];
-    const float val = vals[idx];
-    const float amp = amplitudes[k];
-
-    // --- grad_amplitudes ---
-    if (amp > 1e-12f) {
-        atomicAdd(&grad_amplitudes[k], go * val / amp);
+    // Load point coords into registers
+    float px = 0.0f, py = 0.0f, pz = 0.0f;
+    if (valid) {
+        px = x[n * 3 + 0];
+        py = x[n * 3 + 1];
+        pz = x[n * 3 + 2];
     }
 
-    // --- Recompute forward substitution ---
-    const float d0 = x[n * 3 + 0] - means[k * 3 + 0];
-    const float d1 = x[n * 3 + 1] - means[k * 3 + 1];
-    const float d2 = x[n * 3 + 2] - means[k * 3 + 2];
+    // Register accumulators for grad_x — NO atomicAdd needed!
+    float gx0 = 0.0f, gx1 = 0.0f, gx2 = 0.0f;
 
-    const float* L = &L_chol[k * 9];
-    const float L00 = L[0], L10 = L[3], L11 = L[4];
-    const float L20 = L[6], L21 = L[7], L22 = L[8];
+    // Process all K Gaussians in tiles
+    for (int tile = 0; tile < K; tile += BACKWARD_TILE_K) {
+        const int tile_size = min(BACKWARD_TILE_K, K - tile);
 
-    const float y0 = d0 / L00;
-    const float y1 = (d1 - L10 * y0) / L11;
-    const float y2 = (d2 - L20 * y0 - L21 * y1) / L22;
+        // Cooperative load: threads < tile_size each load one Gaussian
+        if (threadIdx.x < tile_size) {
+            const int k = tile + threadIdx.x;
+            s_means[threadIdx.x * 3 + 0] = means[k * 3 + 0];
+            s_means[threadIdx.x * 3 + 1] = means[k * 3 + 1];
+            s_means[threadIdx.x * 3 + 2] = means[k * 3 + 2];
+            const float* Lk = &L_chol[k * 9];
+            s_L[threadIdx.x * 6 + 0] = Lk[0];  // L00
+            s_L[threadIdx.x * 6 + 1] = Lk[3];  // L10
+            s_L[threadIdx.x * 6 + 2] = Lk[4];  // L11
+            s_L[threadIdx.x * 6 + 3] = Lk[6];  // L20
+            s_L[threadIdx.x * 6 + 4] = Lk[7];  // L21
+            s_L[threadIdx.x * 6 + 5] = Lk[8];  // L22
+            s_amp[threadIdx.x] = amplitudes[k];
+        }
+        __syncthreads();
 
-    // --- grad through Mahalanobis ---
-    const float gm = go * val * (-0.5f);  // grad_mahal
-    const float gy0 = gm * 2.0f * y0;
-    const float gy1 = gm * 2.0f * y1;
-    const float gy2 = gm * 2.0f * y2;
+        for (int tk = 0; tk < tile_size; tk++) {
+            const int k = tile + tk;
 
-    // --- grad_d via backward substitution of L^T gd = gy ---
-    const float gd2 = gy2 / L22;
-    const float gd1 = (gy1 - L21 * gd2) / L11;
-    const float gd0 = (gy0 - L10 * gd1 - L20 * gd2) / L00;
+            // Read grad_output and val for this (n,k)
+            float go = 0.0f, val = 0.0f;
+            if (valid) {
+                go  = grad_output[n * K + k];
+                val = vals[n * K + k];
+            }
 
-    // grad_x (accumulate across K)
-    atomicAdd(&grad_x[n * 3 + 0], gd0);
-    atomicAdd(&grad_x[n * 3 + 1], gd1);
-    atomicAdd(&grad_x[n * 3 + 2], gd2);
+            // --- Compute per-thread gradient contributions ---
+            float lgm0 = 0.0f, lgm1 = 0.0f, lgm2 = 0.0f;
+            float lga = 0.0f;
+            float lgL00 = 0.0f, lgL10 = 0.0f, lgL11 = 0.0f;
+            float lgL20 = 0.0f, lgL21 = 0.0f, lgL22 = 0.0f;
+            float lgx0 = 0.0f, lgx1 = 0.0f, lgx2 = 0.0f;
 
-    // grad_means = -grad_d
-    atomicAdd(&grad_means[k * 3 + 0], -gd0);
-    atomicAdd(&grad_means[k * 3 + 1], -gd1);
-    atomicAdd(&grad_means[k * 3 + 2], -gd2);
+            // Early skip: if contribution is negligible, leave at 0
+            if (valid && fabsf(go * val) > 1e-12f) {
+                const float amp = s_amp[tk];
 
-    // --- grad_L_chol (lower triangular entries) ---
-    // From L y = d, differentiating w.r.t. L_{ij} (j <= i):
-    //   ∂(Ly)_i / ∂L_{ij} = y_j
-    //   grad_L_{ij} = -grad_y_i * y_j / L_{ii}
-    //
-    // But we need to be more careful with the chain rule through
-    // forward substitution.  For lower-triangular L and y = L^{-1}d:
-    //
-    //   y0 = d0 / L00
-    //   y1 = (d1 - L10*y0) / L11
-    //   y2 = (d2 - L20*y0 - L21*y1) / L22
-    //
-    // Direct differentiation:
-    //   ∂y0/∂L00 = -y0/L00
-    //   ∂y1/∂L10 = -y0/L11
-    //   ∂y1/∂L11 = -y1/L11
-    //   ∂y2/∂L20 = -y0/L22
-    //   ∂y2/∂L21 = -y1/L22
-    //   ∂y2/∂L22 = -y2/L22
-    //
-    // But y1 depends on y0, and y2 depends on y0, y1.
-    // The total derivative accounts for indirect effects.
-    //
-    // grad_L_{ij} = Σ_m gy_m * ∂y_m/∂L_{ij}  (total derivative)
-    //
-    // For L00:  gy0 * (-y0/L00) + gy1 * (L10*y0/(L00*L11)) + gy2 * ...
-    //
-    // Simpler formulation: grad_L_{ij} = -(L^{-T} (gy ⊗ y))_{ij}
-    // Which for 3x3 lower triangular is:
-    //
-    // Using the gd (= L^{-T} gy) we already computed:
-    //   grad_L_{ij} = -gd_i * y_j    (for j <= i)
+                // diff = x_n - mu_k (from shared memory)
+                const float d0 = px - s_means[tk * 3 + 0];
+                const float d1 = py - s_means[tk * 3 + 1];
+                const float d2 = pz - s_means[tk * 3 + 2];
 
-    const float gL00 = -gd0 * y0;
-    const float gL10 = -gd1 * y0;
-    const float gL11 = -gd1 * y1;
-    const float gL20 = -gd2 * y0;
-    const float gL21 = -gd2 * y1;
-    const float gL22 = -gd2 * y2;
+                const float L00 = s_L[tk * 6 + 0];
+                const float L10 = s_L[tk * 6 + 1];
+                const float L11 = s_L[tk * 6 + 2];
+                const float L20 = s_L[tk * 6 + 3];
+                const float L21 = s_L[tk * 6 + 4];
+                const float L22 = s_L[tk * 6 + 5];
 
-    // Accumulate across N (row-major 3x3)
-    float* gLk = &grad_L[k * 9];
-    atomicAdd(&gLk[0], gL00);                    // [0,0]
-    atomicAdd(&gLk[3], gL10);                    // [1,0]
-    atomicAdd(&gLk[4], gL11);                    // [1,1]
-    atomicAdd(&gLk[6], gL20);                    // [2,0]
-    atomicAdd(&gLk[7], gL21);                    // [2,1]
-    atomicAdd(&gLk[8], gL22);                    // [2,2]
+                // Forward sub: y = L^{-1} d
+                const float y0 = d0 / L00;
+                const float y1 = (d1 - L10 * y0) / L11;
+                const float y2 = (d2 - L20 * y0 - L21 * y1) / L22;
+
+                // grad through Mahalanobis
+                const float gm = go * val * (-0.5f);
+                const float gy0 = gm * 2.0f * y0;
+                const float gy1 = gm * 2.0f * y1;
+                const float gy2 = gm * 2.0f * y2;
+
+                // Backward sub: gd = L^{-T} gy
+                const float gd2 = gy2 / L22;
+                const float gd1 = (gy1 - L21 * gd2) / L11;
+                const float gd0 = (gy0 - L10 * gd1 - L20 * gd2) / L00;
+
+                // grad_x contribution (accumulated in registers)
+                lgx0 = gd0;  lgx1 = gd1;  lgx2 = gd2;
+
+                // grad_means = -gd
+                lgm0 = -gd0;  lgm1 = -gd1;  lgm2 = -gd2;
+
+                // grad_amplitudes
+                lga = (amp > 1e-12f) ? (go * val / amp) : 0.0f;
+
+                // grad_L_chol: grad_L_{ij} = -gd_i * y_j  (j<=i)
+                lgL00 = -gd0 * y0;
+                lgL10 = -gd1 * y0;  lgL11 = -gd1 * y1;
+                lgL20 = -gd2 * y0;  lgL21 = -gd2 * y1;  lgL22 = -gd2 * y2;
+            }
+
+            // Accumulate grad_x directly (no atomic!)
+            gx0 += lgx0;  gx1 += lgx1;  gx2 += lgx2;
+
+            // --- Warp-level reduction for K-parameter gradients ---
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1) {
+                lgm0  += __shfl_down_sync(0xffffffff, lgm0,  off);
+                lgm1  += __shfl_down_sync(0xffffffff, lgm1,  off);
+                lgm2  += __shfl_down_sync(0xffffffff, lgm2,  off);
+                lga   += __shfl_down_sync(0xffffffff, lga,   off);
+                lgL00 += __shfl_down_sync(0xffffffff, lgL00, off);
+                lgL10 += __shfl_down_sync(0xffffffff, lgL10, off);
+                lgL11 += __shfl_down_sync(0xffffffff, lgL11, off);
+                lgL20 += __shfl_down_sync(0xffffffff, lgL20, off);
+                lgL21 += __shfl_down_sync(0xffffffff, lgL21, off);
+                lgL22 += __shfl_down_sync(0xffffffff, lgL22, off);
+            }
+
+            // Lane 0 of each warp atomicAdds the warp sum (32× fewer atomics)
+            if (lane == 0) {
+                atomicAdd(&grad_means[k * 3 + 0], lgm0);
+                atomicAdd(&grad_means[k * 3 + 1], lgm1);
+                atomicAdd(&grad_means[k * 3 + 2], lgm2);
+                atomicAdd(&grad_amplitudes[k], lga);
+                float* gLk = &grad_L[k * 9];
+                atomicAdd(&gLk[0], lgL00);
+                atomicAdd(&gLk[3], lgL10);
+                atomicAdd(&gLk[4], lgL11);
+                atomicAdd(&gLk[6], lgL20);
+                atomicAdd(&gLk[7], lgL21);
+                atomicAdd(&gLk[8], lgL22);
+            }
+        }
+        __syncthreads();
+    }
+
+    // Write grad_x directly (no atomicAdd!)
+    if (valid) {
+        grad_x[n * 3 + 0] = gx0;
+        grad_x[n * 3 + 1] = gx1;
+        grad_x[n * 3 + 2] = gx2;
+    }
 }
 
 
@@ -217,10 +266,12 @@ std::vector<torch::Tensor> gaussian_eval_backward_cuda(
     auto grad_amplitudes = torch::zeros_like(amplitudes);
     auto grad_L = torch::zeros({K, 9}, x.options());  // (K, 3, 3) flattened
 
+    // Per-point launch: N threads (not N*K), each loops over K
     const int threads = 256;
-    const int blocks = (N * K + threads - 1) / threads;
+    const int blocks = (N + threads - 1) / threads;
+    const int smem = BACKWARD_TILE_K * (3 + 6 + 1) * sizeof(float);
 
-    gaussian_eval_backward_kernel<<<blocks, threads>>>(
+    gaussian_eval_backward_kernel<<<blocks, threads, smem>>>(
         grad_output.data_ptr<float>(),
         x.data_ptr<float>(),
         means.data_ptr<float>(),
@@ -300,19 +351,12 @@ __global__ void forward_with_grad_kernel(
 
 
 // ============================================================
-// Backward for analytical field gradient supervision
+// OPTIMIZED Backward for analytical field gradient supervision
 // ============================================================
-// Given upstream gradient g (N,3) from L1 loss on field gradient:
-//   L = Σ_n Σ_j |∇f_j(x_n) - ∂v/∂x_j(x_n)|
+// Per-point with shared memory tiling and warp-level reduction.
+// Same math as original but restructured for fewer atomicAdds.
 //
-// Per (n,k): contribution to ∇f_j is c_{j} = -v_nk * s_{j}
-// where v_nk = a_k exp(-0.5 m), s = L^{-T}y = Σ^{-1}(x-μ)
-//
-// ∂c_j/∂a_k = (v/a) * (-s_j)
-// ∂c_j/∂μ_i = -[∂v/∂μ_i * s_j + v * ∂s_j/∂μ_i]
-//           = -[v*s_i*s_j - v*Σ^{-1}_{j,i}]   (since ∂v/∂μ=v*s, ∂s/∂μ=-Σ^{-1})
-//           = v*(Σ^{-1}_{j,i} - s_i*s_j)
-// ∂c_j/∂L: needs chain through y→s→c
+__launch_bounds__(256, 4)
 __global__ void analytical_grad_supervision_backward_kernel(
     const float* __restrict__ grad_out,     // (N, 3) upstream gradient
     const float* __restrict__ x,            // (N, 3)
@@ -325,194 +369,153 @@ __global__ void analytical_grad_supervision_backward_kernel(
     const int N,
     const int K
 ) {
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= N * K) return;
+    __shared__ float s_means[BACKWARD_TILE_K * 3];
+    __shared__ float s_L[BACKWARD_TILE_K * 6];
+    __shared__ float s_amp[BACKWARD_TILE_K];
 
-    const int n = idx / K;
-    const int k = idx % K;
+    const int n = blockIdx.x * blockDim.x + threadIdx.x;
+    const int lane = threadIdx.x & 31;
+    const bool valid = (n < N);
 
-    const float amp = amplitudes[k];
-
-    const float d0 = x[n*3+0] - means[k*3+0];
-    const float d1 = x[n*3+1] - means[k*3+1];
-    const float d2 = x[n*3+2] - means[k*3+2];
-
-    const float* L = &L_chol[k * 9];
-    const float L00 = L[0], L10 = L[3], L11 = L[4];
-    const float L20 = L[6], L21 = L[7], L22 = L[8];
-
-    // Forward substitution: y = L^{-1} d
-    const float y0 = d0 / L00;
-    const float y1 = (d1 - L10*y0) / L11;
-    const float y2 = (d2 - L20*y0 - L21*y1) / L22;
-
-    const float mahal = y0*y0 + y1*y1 + y2*y2;
-    const float v = amp * expf(-0.5f * mahal);
-
-    // Backward substitution: s = L^{-T} y
-    const float s2 = y2 / L22;
-    const float s1 = (y1 - L21*s2) / L11;
-    const float s0 = (y0 - L10*s1 - L20*s2) / L00;
-
-    // Upstream gradient for this point
-    const float g0 = grad_out[n*3+0];
-    const float g1 = grad_out[n*3+1];
-    const float g2 = grad_out[n*3+2];
-
-    // g · s  (dot product of upstream grad and s)
-    const float gs = g0*s0 + g1*s1 + g2*s2;
-
-    // ---- grad_amplitudes ----
-    // c_j = -v*s_j, ∂c_j/∂a = -(v/a)*s_j
-    // ∂L/∂a = Σ_j g_j * ∂c_j/∂a = -(v/a) * (g·s)
-    if (amp > 1e-12f) {
-        atomicAdd(&grad_amplitudes[k], -gs * v / amp);
+    float px = 0.0f, py = 0.0f, pz = 0.0f;
+    float g0 = 0.0f, g1 = 0.0f, g2 = 0.0f;
+    if (valid) {
+        px = x[n*3+0];  py = x[n*3+1];  pz = x[n*3+2];
+        g0 = grad_out[n*3+0];  g1 = grad_out[n*3+1];  g2 = grad_out[n*3+2];
     }
 
-    // ---- grad_means ----
-    // ∂c_j/∂μ_i = v * (Σ^{-1}_{j,i} - s_i*s_j)
-    // ∂L/∂μ_i = Σ_j g_j * v * (Σ^{-1}_{j,i} - s_i*s_j)
-    //         = v * (Σ^{-1,T} g - s * (g·s))_i
-    //         = v * ((Σ^{-1} g)_i - s_i * gs)
-    //
-    // Σ^{-1} g = L^{-T} L^{-1} g
-    // First: L^{-1} g (forward sub on g)
-    const float f0 = g0 / L00;
-    const float f1 = (g1 - L10*f0) / L11;
-    const float f2 = (g2 - L20*f0 - L21*f1) / L22;
-    // Then: L^{-T} f (backward sub)
-    const float q2 = f2 / L22;
-    const float q1 = (f1 - L21*q2) / L11;
-    const float q0 = (f0 - L10*q1 - L20*q2) / L00;
-    // Σ^{-1} g = (q0, q1, q2)
+    for (int tile = 0; tile < K; tile += BACKWARD_TILE_K) {
+        const int tile_size = min(BACKWARD_TILE_K, K - tile);
 
-    const float gm0 = v * (q0 - s0 * gs);
-    const float gm1 = v * (q1 - s1 * gs);
-    const float gm2 = v * (q2 - s2 * gs);
+        if (threadIdx.x < tile_size) {
+            const int k = tile + threadIdx.x;
+            s_means[threadIdx.x * 3 + 0] = means[k * 3 + 0];
+            s_means[threadIdx.x * 3 + 1] = means[k * 3 + 1];
+            s_means[threadIdx.x * 3 + 2] = means[k * 3 + 2];
+            const float* Lk = &L_chol[k * 9];
+            s_L[threadIdx.x * 6 + 0] = Lk[0];
+            s_L[threadIdx.x * 6 + 1] = Lk[3];
+            s_L[threadIdx.x * 6 + 2] = Lk[4];
+            s_L[threadIdx.x * 6 + 3] = Lk[6];
+            s_L[threadIdx.x * 6 + 4] = Lk[7];
+            s_L[threadIdx.x * 6 + 5] = Lk[8];
+            s_amp[threadIdx.x] = amplitudes[k];
+        }
+        __syncthreads();
 
-    atomicAdd(&grad_means[k*3+0], gm0);
-    atomicAdd(&grad_means[k*3+1], gm1);
-    atomicAdd(&grad_means[k*3+2], gm2);
+        for (int tk = 0; tk < tile_size; tk++) {
+            const int k = tile + tk;
 
-    // ---- grad_L_chol ----
-    // c_j = -v * s_j where v = a*exp(-0.5*m), s = L^{-T}y, y = L^{-1}d
-    // ∂c_j/∂L_{pq} involves:
-    //   (a) ∂v/∂L_{pq} = v * (-0.5) * ∂m/∂L_{pq}
-    //       ∂m/∂L_{pq} = 2 * y_p * ∂y_p/∂L_{pq}  (chain through y)
-    //       Using the standard result: ∂y/∂L_{pq} ~ -gd_p * y_q  
-    //       where gd = L^{-T}(∂m/∂y) but simplified for Cholesky
-    //   (b) ∂s_j/∂L_{pq} involves differentiating L^{-T}y through both L^{-T} and y
-    //
-    // Rather than derive all terms analytically, use the compact form:
-    // From c = -v*s, and using gd (the backward sub of gy through L^T):
-    //   grad_L from the value part: like in the main backward kernel
-    //   grad_L from the gradient part: from differentiating s w.r.t. L
-    //
-    // Total gradient of L_{pq} from the field gradient contribution:
-    // This uses the "double backward substitution" approach.
-    //
-    // Part 1: gradient through v (same structure as main backward)
-    // ∂(Σ_j g_j * c_j)/∂v = -gs (already computed)
-    // ∂v/∂mahal = v * (-0.5)
-    // ∂mahal/∂y_i = 2*y_i
-    // Chain: grad_y_from_v_i = -gs * v * (-0.5) * 2 * y_i = gs * v * y_i
-    const float gvy0 = gs * v * y0;
-    const float gvy1 = gs * v * y1;
-    const float gvy2 = gs * v * y2;
+            float lgm0 = 0, lgm1 = 0, lgm2 = 0;
+            float lga = 0;
+            float lgL00 = 0, lgL10 = 0, lgL11 = 0;
+            float lgL20 = 0, lgL21 = 0, lgL22 = 0;
 
-    // gd from v part: L^{-T} gvy
-    const float gvd2 = gvy2 / L22;
-    const float gvd1 = (gvy1 - L21*gvd2) / L11;
-    const float gvd0 = (gvy0 - L10*gvd1 - L20*gvd2) / L00;
+            if (valid) {
+                const float amp = s_amp[tk];
+                const float d0 = px - s_means[tk * 3 + 0];
+                const float d1 = py - s_means[tk * 3 + 1];
+                const float d2 = pz - s_means[tk * 3 + 2];
 
-    // grad_L from v part: -gvd_i * y_j (same pattern as main backward)
-    float gL00 = -gvd0 * y0;
-    float gL10 = -gvd1 * y0;
-    float gL11 = -gvd1 * y1;
-    float gL20 = -gvd2 * y0;
-    float gL21 = -gvd2 * y1;
-    float gL22 = -gvd2 * y2;
+                const float L00 = s_L[tk * 6 + 0], L10 = s_L[tk * 6 + 1];
+                const float L11 = s_L[tk * 6 + 2], L20 = s_L[tk * 6 + 3];
+                const float L21 = s_L[tk * 6 + 4], L22 = s_L[tk * 6 + 5];
 
-    // Part 2: gradient through s (the L^{-T}y part)
-    // c_j = -v * s_j, upstream for s_j is -v * g_j
-    // s = L^{-T} y, so we need ∂s/∂L and ∂s/∂y (which chains through ∂y/∂L)
-    //
-    // For s = L^{-T} y:
-    //   s2 = y2/L22
-    //   s1 = (y1 - L21*s2)/L11
-    //   s0 = (y0 - L10*s1 - L20*s2)/L00
-    //
-    // Upstream: gs_j = -v * g_j (grad of loss w.r.t. s_j)
-    const float gs0 = -v * g0;
-    const float gs1 = -v * g1;
-    const float gs2 = -v * g2;
+                const float y0 = d0 / L00;
+                const float y1 = (d1 - L10*y0) / L11;
+                const float y2 = (d2 - L20*y0 - L21*y1) / L22;
 
-    // Backward through s = L^{-T} y to get grad_y_from_s and grad_L_from_s
-    // ∂s0/∂L00 = -s0/L00
-    // ∂s0/∂L10 = -(-s1)/L00 = s1/L00  ... wait, let me be careful
-    // s0 = (y0 - L10*s1 - L20*s2)/L00
-    // ∂s0/∂L00 = -(y0 - L10*s1 - L20*s2)/L00² = -s0/L00
-    // ∂s0/∂L10 = -s1/L00
-    // ∂s0/∂L20 = -s2/L00
-    // s1 = (y1 - L21*s2)/L11
-    // ∂s1/∂L11 = -s1/L11
-    // ∂s1/∂L21 = -s2/L11
-    // s2 = y2/L22
-    // ∂s2/∂L22 = -s2/L22
-    //
-    // Also need grad_y from s (to chain with grad_L from y):
-    // ∂s2/∂y2 = 1/L22
-    // ∂s1/∂y1 = 1/L11
-    // ∂s1/∂y2 = -L21/(L11*L22)  (through s2)
-    // ∂s0/∂y0 = 1/L00
-    // ∂s0/∂y1 = -L10/(L00*L11)  (through s1)
-    // ... this is essentially L^{-1} applied to gs (another forward sub)
-    //
-    // grad_y_from_s = L^{-1} gs  (forward substitution on gs)
-    const float gsy0 = gs0 / L00;
-    const float gsy1 = (gs1 - L10*gsy0) / L11;
-    const float gsy2 = (gs2 - L20*gsy0 - L21*gsy1) / L22;
+                const float mahal = y0*y0 + y1*y1 + y2*y2;
+                const float v = amp * expf(-0.5f * mahal);
 
-    // grad_L from s (direct differentiation): -gs_i * s_j / L_ii equivalent
-    // Using the pattern: grad_L_{ij} from backward sub = -gsd_i * s_j
-    // where gsd = forward_sub(gs) ... let me use the same pattern as main backward
-    // For backward substitution s = L^{-T} y, differentiating w.r.t. L:
-    //   grad_L_{ij} = -gbs_i * s_j   where gbs = L^{-1} gs (forward sub)
-    // Wait, this follows the same logic: for Ly = d, grad_L_{ij} = -gd_i * y_j
-    // For L^T s = y (transpose system), differentiating w.r.t. L^T_{ij}:
-    //   grad_L^T_{ij} = -gds_i * s_j  where gds = L^{-1} gs
-    // Since L^T_{ij} = L_{ji}, we need to transpose the indices
-    // So grad_L_{ji} from s = -gsy_i * s_j
-    // i.e. grad_L_{ij} from s = -gsy_j * s_i
-    gL00 += -gsy0 * s0;
-    gL10 += -gsy0 * s1;  // grad_L[1,0] = -gsy_0 * s_1
-    gL11 += -gsy1 * s1;
-    gL20 += -gsy0 * s2;  // grad_L[2,0] = -gsy_0 * s_2
-    gL21 += -gsy1 * s2;  // grad_L[2,1] = -gsy_1 * s_2
-    gL22 += -gsy2 * s2;
+                // Skip negligible contributions
+                if (fabsf(v) > 1e-12f) {
+                    const float s2 = y2 / L22;
+                    const float s1 = (y1 - L21*s2) / L11;
+                    const float s0 = (y0 - L10*s1 - L20*s2) / L00;
 
-    // Now grad_y_from_s needs to chain through y = L^{-1} d to get more grad_L
-    // grad_L from y (given upstream gsy): same pattern as main backward
-    // gyd = L^{-T} gsy (backward sub)
-    const float gyd2 = gsy2 / L22;
-    const float gyd1 = (gsy1 - L21*gyd2) / L11;
-    const float gyd0 = (gsy0 - L10*gyd1 - L20*gyd2) / L00;
+                    const float gs = g0*s0 + g1*s1 + g2*s2;
 
-    gL00 += -gyd0 * y0;
-    gL10 += -gyd1 * y0;
-    gL11 += -gyd1 * y1;
-    gL20 += -gyd2 * y0;
-    gL21 += -gyd2 * y1;
-    gL22 += -gyd2 * y2;
+                    // grad_amplitudes
+                    lga = (amp > 1e-12f) ? (-gs * v / amp) : 0.0f;
 
-    // Accumulate
-    float* gLk = &grad_L[k * 9];
-    atomicAdd(&gLk[0], gL00);
-    atomicAdd(&gLk[3], gL10);
-    atomicAdd(&gLk[4], gL11);
-    atomicAdd(&gLk[6], gL20);
-    atomicAdd(&gLk[7], gL21);
-    atomicAdd(&gLk[8], gL22);
+                    // grad_means: v * (Σ^{-1}g - s*(g·s))
+                    const float f0 = g0 / L00;
+                    const float f1 = (g1 - L10*f0) / L11;
+                    const float f2 = (g2 - L20*f0 - L21*f1) / L22;
+                    const float q2 = f2 / L22;
+                    const float q1 = (f1 - L21*q2) / L11;
+                    const float q0 = (f0 - L10*q1 - L20*q2) / L00;
+
+                    lgm0 = v * (q0 - s0 * gs);
+                    lgm1 = v * (q1 - s1 * gs);
+                    lgm2 = v * (q2 - s2 * gs);
+
+                    // --- grad_L_chol ---
+                    // Part 1: gradient through v
+                    const float gvy0 = gs * v * y0;
+                    const float gvy1 = gs * v * y1;
+                    const float gvy2 = gs * v * y2;
+                    const float gvd2 = gvy2 / L22;
+                    const float gvd1 = (gvy1 - L21*gvd2) / L11;
+                    const float gvd0 = (gvy0 - L10*gvd1 - L20*gvd2) / L00;
+
+                    lgL00 = -gvd0 * y0;
+                    lgL10 = -gvd1 * y0;  lgL11 = -gvd1 * y1;
+                    lgL20 = -gvd2 * y0;  lgL21 = -gvd2 * y1;  lgL22 = -gvd2 * y2;
+
+                    // Part 2: gradient through s = L^{-T}y
+                    const float gs0 = -v * g0, gs1 = -v * g1, gs2 = -v * g2;
+                    const float gsy0 = gs0 / L00;
+                    const float gsy1 = (gs1 - L10*gsy0) / L11;
+                    const float gsy2 = (gs2 - L20*gsy0 - L21*gsy1) / L22;
+
+                    lgL00 += -gsy0 * s0;
+                    lgL10 += -gsy0 * s1;  lgL11 += -gsy1 * s1;
+                    lgL20 += -gsy0 * s2;  lgL21 += -gsy1 * s2;  lgL22 += -gsy2 * s2;
+
+                    // Part 3: chain grad_y_from_s through y = L^{-1}d
+                    const float gyd2 = gsy2 / L22;
+                    const float gyd1 = (gsy1 - L21*gyd2) / L11;
+                    const float gyd0 = (gsy0 - L10*gyd1 - L20*gyd2) / L00;
+
+                    lgL00 += -gyd0 * y0;
+                    lgL10 += -gyd1 * y0;  lgL11 += -gyd1 * y1;
+                    lgL20 += -gyd2 * y0;  lgL21 += -gyd2 * y1;  lgL22 += -gyd2 * y2;
+                }
+            }
+
+            // Warp-level reduction
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1) {
+                lgm0  += __shfl_down_sync(0xffffffff, lgm0,  off);
+                lgm1  += __shfl_down_sync(0xffffffff, lgm1,  off);
+                lgm2  += __shfl_down_sync(0xffffffff, lgm2,  off);
+                lga   += __shfl_down_sync(0xffffffff, lga,   off);
+                lgL00 += __shfl_down_sync(0xffffffff, lgL00, off);
+                lgL10 += __shfl_down_sync(0xffffffff, lgL10, off);
+                lgL11 += __shfl_down_sync(0xffffffff, lgL11, off);
+                lgL20 += __shfl_down_sync(0xffffffff, lgL20, off);
+                lgL21 += __shfl_down_sync(0xffffffff, lgL21, off);
+                lgL22 += __shfl_down_sync(0xffffffff, lgL22, off);
+            }
+
+            if (lane == 0) {
+                atomicAdd(&grad_means[k * 3 + 0], lgm0);
+                atomicAdd(&grad_means[k * 3 + 1], lgm1);
+                atomicAdd(&grad_means[k * 3 + 2], lgm2);
+                atomicAdd(&grad_amplitudes[k], lga);
+                float* gLk = &grad_L[k * 9];
+                atomicAdd(&gLk[0], lgL00);
+                atomicAdd(&gLk[3], lgL10);
+                atomicAdd(&gLk[4], lgL11);
+                atomicAdd(&gLk[6], lgL20);
+                atomicAdd(&gLk[7], lgL21);
+                atomicAdd(&gLk[8], lgL22);
+            }
+        }
+        __syncthreads();
+    }
 }
 
 
@@ -572,10 +575,12 @@ std::vector<torch::Tensor> analytical_grad_supervision_backward_cuda(
     auto grad_amplitudes = torch::zeros_like(amplitudes);
     auto grad_L = torch::zeros({K, 9}, means.options());
 
+    // Per-point launch: N threads, each loops over K
     const int threads = 256;
-    const int blocks = (N * K + threads - 1) / threads;
+    const int blocks = (N + threads - 1) / threads;
+    const int smem = BACKWARD_TILE_K * (3 + 6 + 1) * sizeof(float);
 
-    analytical_grad_supervision_backward_kernel<<<blocks, threads>>>(
+    analytical_grad_supervision_backward_kernel<<<blocks, threads, smem>>>(
         grad_out.data_ptr<float>(),
         x.data_ptr<float>(),
         means.data_ptr<float>(),
@@ -592,18 +597,14 @@ std::vector<torch::Tensor> analytical_grad_supervision_backward_cuda(
 
 
 // ============================================================
-// Fused gradient supervision BACKWARD kernel
+// OPTIMIZED Fused gradient supervision BACKWARD kernel
 // ============================================================
-// Computes gradients of the gradient supervision loss w.r.t.
-// means, L_chol, and amplitudes in a single fused kernel.
+// Per-point with shared memory tiling and warp-level reduction.
+// Each thread handles one point n, loops over K Gaussians in tiles,
+// evaluates the Gaussian at 4 neighbouring points, and accumulates
+// gradients for means, L_chol, and amplitudes.
 //
-// The gradient supervision loss per point n is:
-//   L_n = |Δpred_x - Δgt_x| + |Δpred_y - Δgt_y| + |Δpred_z - Δgt_z|
-// where Δpred_x = f(x_dx) - f(x_c), Δgt_x = v_dx - v_c, etc.
-//
-// Each thread handles one (n, k) pair, computing the contribution of
-// Gaussian k to the gradient at point n, and accumulates gradients
-// via atomicAdd.
+__launch_bounds__(256, 4)
 __global__ void gradient_supervision_backward_kernel(
     const float* __restrict__ grad_out,     // (N,) upstream gradient (from .mean())
     const float* __restrict__ x_center,     // (N, 3)
@@ -617,7 +618,6 @@ __global__ void gradient_supervision_backward_kernel(
     const float* __restrict__ means,        // (K, 3)
     const float* __restrict__ L_chol,       // (K, 3, 3)
     const float* __restrict__ amplitudes,   // (K,)
-    // We need the sum predictions to compute signs of the L1 loss
     const float* __restrict__ pred_sums,    // (N, 4) = [pred_c, pred_dx, pred_dy, pred_dz]
     float* __restrict__ grad_means,         // (K, 3)
     float* __restrict__ grad_L,             // (K, 9)
@@ -625,152 +625,179 @@ __global__ void gradient_supervision_backward_kernel(
     const int N,
     const int K
 ) {
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= N * K) return;
+    __shared__ float s_means[BACKWARD_TILE_K * 3];
+    __shared__ float s_L[BACKWARD_TILE_K * 6];
+    __shared__ float s_amp[BACKWARD_TILE_K];
 
-    const int n = idx / K;
-    const int k = idx % K;
+    const int n = blockIdx.x * blockDim.x + threadIdx.x;
+    const int lane = threadIdx.x & 31;
+    const bool valid = (n < N);
 
-    const float go = grad_out[n];
-    const float amp = amplitudes[k];
+    // Load per-point data into registers
+    float cx0 = 0, cx1 = 0, cx2 = 0;
+    float dx0 = 0, dx1 = 0, dx2 = 0;
+    float dy0 = 0, dy1 = 0, dy2 = 0;
+    float dz0 = 0, dz1 = 0, dz2 = 0;
+    float go = 0, sx = 0, sy = 0, sz = 0;
 
-    const float* L = &L_chol[k * 9];
-    const float L00 = L[0], L10 = L[3], L11 = L[4];
-    const float L20 = L[6], L21 = L[7], L22 = L[8];
+    if (valid) {
+        cx0 = x_center[n*3+0]; cx1 = x_center[n*3+1]; cx2 = x_center[n*3+2];
+        dx0 = x_dx[n*3+0]; dx1 = x_dx[n*3+1]; dx2 = x_dx[n*3+2];
+        dy0 = x_dy[n*3+0]; dy1 = x_dy[n*3+1]; dy2 = x_dy[n*3+2];
+        dz0 = x_dz[n*3+0]; dz1 = x_dz[n*3+1]; dz2 = x_dz[n*3+2];
 
-    // Evaluate this Gaussian k at all 4 points
-    // Center
-    float dc0 = x_center[n*3+0] - means[k*3+0];
-    float dc1 = x_center[n*3+1] - means[k*3+1];
-    float dc2 = x_center[n*3+2] - means[k*3+2];
-    float yc0 = dc0 / L00;
-    float yc1 = (dc1 - L10*yc0) / L11;
-    float yc2 = (dc2 - L20*yc0 - L21*yc1) / L22;
-    float mc = yc0*yc0 + yc1*yc1 + yc2*yc2;
-    float vc = amp * expf(-0.5f * mc);
+        go = grad_out[n];
 
-    // x+dx
-    float ddx0 = x_dx[n*3+0] - means[k*3+0];
-    float ddx1 = x_dx[n*3+1] - means[k*3+1];
-    float ddx2 = x_dx[n*3+2] - means[k*3+2];
-    float ydx0 = ddx0 / L00;
-    float ydx1 = (ddx1 - L10*ydx0) / L11;
-    float ydx2 = (ddx2 - L20*ydx0 - L21*ydx1) / L22;
-    float mdx = ydx0*ydx0 + ydx1*ydx1 + ydx2*ydx2;
-    float vdx = amp * expf(-0.5f * mdx);
+        // Precompute L1 signs from pred_sums
+        float pred_c   = pred_sums[n*4 + 0];
+        float pred_dx_s = pred_sums[n*4 + 1];
+        float pred_dy_s = pred_sums[n*4 + 2];
+        float pred_dz_s = pred_sums[n*4 + 3];
 
-    // y+dy
-    float ddy0 = x_dy[n*3+0] - means[k*3+0];
-    float ddy1 = x_dy[n*3+1] - means[k*3+1];
-    float ddy2 = x_dy[n*3+2] - means[k*3+2];
-    float ydy0 = ddy0 / L00;
-    float ydy1 = (ddy1 - L10*ydy0) / L11;
-    float ydy2 = (ddy2 - L20*ydy0 - L21*ydy1) / L22;
-    float mdy = ydy0*ydy0 + ydy1*ydy1 + ydy2*ydy2;
-    float vdy = amp * expf(-0.5f * mdy);
+        float diff_x = (pred_dx_s - pred_c) - (v_dx[n] - v_center[n]);
+        float diff_y = (pred_dy_s - pred_c) - (v_dy[n] - v_center[n]);
+        float diff_z = (pred_dz_s - pred_c) - (v_dz[n] - v_center[n]);
 
-    // z+dz
-    float ddz0 = x_dz[n*3+0] - means[k*3+0];
-    float ddz1 = x_dz[n*3+1] - means[k*3+1];
-    float ddz2 = x_dz[n*3+2] - means[k*3+2];
-    float ydz0 = ddz0 / L00;
-    float ydz1 = (ddz1 - L10*ydz0) / L11;
-    float ydz2 = (ddz2 - L20*ydz0 - L21*ydz1) / L22;
-    float mdz = ydz0*ydz0 + ydz1*ydz1 + ydz2*ydz2;
-    float vdz = amp * expf(-0.5f * mdz);
-
-    // Get the sum predictions (all Gaussians at this point)
-    float pred_c  = pred_sums[n*4 + 0];
-    float pred_dx_sum = pred_sums[n*4 + 1];
-    float pred_dy_sum = pred_sums[n*4 + 2];
-    float pred_dz_sum = pred_sums[n*4 + 3];
-
-    // Signed differences
-    float diff_x = (pred_dx_sum - pred_c) - (v_dx[n] - v_center[n]);
-    float diff_y = (pred_dy_sum - pred_c) - (v_dy[n] - v_center[n]);
-    float diff_z = (pred_dz_sum - pred_c) - (v_dz[n] - v_center[n]);
-
-    // Signs for L1 gradient: d|x|/dx = sign(x)
-    float sx = (diff_x > 0.0f) ? 1.0f : ((diff_x < 0.0f) ? -1.0f : 0.0f);
-    float sy = (diff_y > 0.0f) ? 1.0f : ((diff_y < 0.0f) ? -1.0f : 0.0f);
-    float sz = (diff_z > 0.0f) ? 1.0f : ((diff_z < 0.0f) ? -1.0f : 0.0f);
-
-    // grad of L1 loss w.r.t. each per-Gaussian value:
-    // L_n = |Σ_k(vdx_k - vc_k) - Δgt_x| + ...
-    // ∂L_n/∂vc_k  = -sx - sy - sz  (center appears in all 3 diffs)
-    // ∂L_n/∂vdx_k = +sx
-    // ∂L_n/∂vdy_k = +sy
-    // ∂L_n/∂vdz_k = +sz
-
-    float g_vc  = go * (-sx - sy - sz);
-    float g_vdx = go * sx;
-    float g_vdy = go * sy;
-    float g_vdz = go * sz;
-
-    // Now chain through each evaluation: v = amp * exp(-0.5*m)
-    // ∂v/∂amp = exp(-0.5*m) = v/amp
-    // ∂v/∂m   = v * (-0.5)
-    // ∂m/∂y_i = 2*y_i
-    // ∂y/∂d via backward sub: gd = L^{-T} gy
-    // ∂d/∂mean = -1, ∂d/∂x = +1
-
-    // Helper: given upstream grad gv for one evaluation,
-    // compute and accumulate grads for means, L, amplitudes
-    // We'll inline this for each of the 4 evaluations
-
-    // --- grad_amplitudes ---
-    float ga = 0.0f;
-    if (amp > 1e-12f) {
-        ga += g_vc  * vc  / amp;
-        ga += g_vdx * vdx / amp;
-        ga += g_vdy * vdy / amp;
-        ga += g_vdz * vdz / amp;
-    }
-    atomicAdd(&grad_amplitudes[k], ga);
-
-    // Accumulate grad_means and grad_L from all 4 evaluations
-    float gm0 = 0.0f, gm1 = 0.0f, gm2 = 0.0f;
-    float gL00_acc = 0.0f, gL10_acc = 0.0f, gL11_acc = 0.0f;
-    float gL20_acc = 0.0f, gL21_acc = 0.0f, gL22_acc = 0.0f;
-
-    // Macro for one evaluation's gradient contribution
-    #define ACCUM_GRADS(gv, val, y0, y1, y2) \
-    { \
-        float gm_val = gv * val * (-0.5f); \
-        float gy0 = gm_val * 2.0f * y0; \
-        float gy1 = gm_val * 2.0f * y1; \
-        float gy2 = gm_val * 2.0f * y2; \
-        float gd2 = gy2 / L22; \
-        float gd1 = (gy1 - L21 * gd2) / L11; \
-        float gd0 = (gy0 - L10 * gd1 - L20 * gd2) / L00; \
-        gm0 -= gd0; gm1 -= gd1; gm2 -= gd2; \
-        gL00_acc += -gd0 * y0; \
-        gL10_acc += -gd1 * y0; \
-        gL11_acc += -gd1 * y1; \
-        gL20_acc += -gd2 * y0; \
-        gL21_acc += -gd2 * y1; \
-        gL22_acc += -gd2 * y2; \
+        sx = (diff_x > 0.0f) ? 1.0f : ((diff_x < 0.0f) ? -1.0f : 0.0f);
+        sy = (diff_y > 0.0f) ? 1.0f : ((diff_y < 0.0f) ? -1.0f : 0.0f);
+        sz = (diff_z > 0.0f) ? 1.0f : ((diff_z < 0.0f) ? -1.0f : 0.0f);
     }
 
-    ACCUM_GRADS(g_vc,  vc,  yc0,  yc1,  yc2)
-    ACCUM_GRADS(g_vdx, vdx, ydx0, ydx1, ydx2)
-    ACCUM_GRADS(g_vdy, vdy, ydy0, ydy1, ydy2)
-    ACCUM_GRADS(g_vdz, vdz, ydz0, ydz1, ydz2)
+    for (int tile = 0; tile < K; tile += BACKWARD_TILE_K) {
+        const int tile_size = min(BACKWARD_TILE_K, K - tile);
 
-    #undef ACCUM_GRADS
+        if (threadIdx.x < tile_size) {
+            const int k = tile + threadIdx.x;
+            s_means[threadIdx.x * 3 + 0] = means[k * 3 + 0];
+            s_means[threadIdx.x * 3 + 1] = means[k * 3 + 1];
+            s_means[threadIdx.x * 3 + 2] = means[k * 3 + 2];
+            const float* Lk = &L_chol[k * 9];
+            s_L[threadIdx.x * 6 + 0] = Lk[0];
+            s_L[threadIdx.x * 6 + 1] = Lk[3];
+            s_L[threadIdx.x * 6 + 2] = Lk[4];
+            s_L[threadIdx.x * 6 + 3] = Lk[6];
+            s_L[threadIdx.x * 6 + 4] = Lk[7];
+            s_L[threadIdx.x * 6 + 5] = Lk[8];
+            s_amp[threadIdx.x] = amplitudes[k];
+        }
+        __syncthreads();
 
-    // Accumulate into global arrays
-    atomicAdd(&grad_means[k*3+0], gm0);
-    atomicAdd(&grad_means[k*3+1], gm1);
-    atomicAdd(&grad_means[k*3+2], gm2);
+        for (int tk = 0; tk < tile_size; tk++) {
+            const int k = tile + tk;
 
-    float* gLk = &grad_L[k * 9];
-    atomicAdd(&gLk[0], gL00_acc);
-    atomicAdd(&gLk[3], gL10_acc);
-    atomicAdd(&gLk[4], gL11_acc);
-    atomicAdd(&gLk[6], gL20_acc);
-    atomicAdd(&gLk[7], gL21_acc);
-    atomicAdd(&gLk[8], gL22_acc);
+            float lgm0 = 0, lgm1 = 0, lgm2 = 0;
+            float lga = 0;
+            float lgL00 = 0, lgL10 = 0, lgL11 = 0;
+            float lgL20 = 0, lgL21 = 0, lgL22 = 0;
+
+            if (valid) {
+                const float amp = s_amp[tk];
+                const float mk0 = s_means[tk * 3 + 0];
+                const float mk1 = s_means[tk * 3 + 1];
+                const float mk2 = s_means[tk * 3 + 2];
+                const float L00 = s_L[tk * 6 + 0], L10 = s_L[tk * 6 + 1];
+                const float L11 = s_L[tk * 6 + 2], L20 = s_L[tk * 6 + 3];
+                const float L21 = s_L[tk * 6 + 4], L22 = s_L[tk * 6 + 5];
+
+                // Evaluate at center
+                float y0, y1, y2, m;
+                y0 = (cx0 - mk0) / L00;
+                y1 = (cx1 - mk1 - L10*y0) / L11;
+                y2 = (cx2 - mk2 - L20*y0 - L21*y1) / L22;
+                m = y0*y0 + y1*y1 + y2*y2;
+                float vc = amp * expf(-0.5f * m);
+                float yc0 = y0, yc1 = y1, yc2 = y2;
+
+                // Evaluate at x+dx
+                y0 = (dx0 - mk0) / L00;
+                y1 = (dx1 - mk1 - L10*y0) / L11;
+                y2 = (dx2 - mk2 - L20*y0 - L21*y1) / L22;
+                m = y0*y0 + y1*y1 + y2*y2;
+                float vdx = amp * expf(-0.5f * m);
+                float ydx0 = y0, ydx1 = y1, ydx2 = y2;
+
+                // Evaluate at y+dy
+                y0 = (dy0 - mk0) / L00;
+                y1 = (dy1 - mk1 - L10*y0) / L11;
+                y2 = (dy2 - mk2 - L20*y0 - L21*y1) / L22;
+                m = y0*y0 + y1*y1 + y2*y2;
+                float vdy = amp * expf(-0.5f * m);
+                float ydy0 = y0, ydy1 = y1, ydy2 = y2;
+
+                // Evaluate at z+dz
+                y0 = (dz0 - mk0) / L00;
+                y1 = (dz1 - mk1 - L10*y0) / L11;
+                y2 = (dz2 - mk2 - L20*y0 - L21*y1) / L22;
+                m = y0*y0 + y1*y1 + y2*y2;
+                float vdz = amp * expf(-0.5f * m);
+                float ydz0 = y0, ydz1 = y1, ydz2 = y2;
+
+                // Upstream grads for each evaluation
+                float g_vc  = go * (-sx - sy - sz);
+                float g_vdx = go * sx;
+                float g_vdy = go * sy;
+                float g_vdz = go * sz;
+
+                // grad_amplitudes
+                if (amp > 1e-12f) {
+                    lga = (g_vc * vc + g_vdx * vdx + g_vdy * vdy + g_vdz * vdz) / amp;
+                }
+
+                // Macro-inline: accumulate grad_means and grad_L from each evaluation
+                #define ACCUM_GRADS_V2(gv, val, _y0, _y1, _y2) \
+                { \
+                    float gm_val = gv * val * (-0.5f); \
+                    float _gy0 = gm_val * 2.0f * _y0; \
+                    float _gy1 = gm_val * 2.0f * _y1; \
+                    float _gy2 = gm_val * 2.0f * _y2; \
+                    float _gd2 = _gy2 / L22; \
+                    float _gd1 = (_gy1 - L21 * _gd2) / L11; \
+                    float _gd0 = (_gy0 - L10 * _gd1 - L20 * _gd2) / L00; \
+                    lgm0 -= _gd0; lgm1 -= _gd1; lgm2 -= _gd2; \
+                    lgL00 += -_gd0 * _y0; \
+                    lgL10 += -_gd1 * _y0; lgL11 += -_gd1 * _y1; \
+                    lgL20 += -_gd2 * _y0; lgL21 += -_gd2 * _y1; lgL22 += -_gd2 * _y2; \
+                }
+
+                ACCUM_GRADS_V2(g_vc,  vc,  yc0,  yc1,  yc2)
+                ACCUM_GRADS_V2(g_vdx, vdx, ydx0, ydx1, ydx2)
+                ACCUM_GRADS_V2(g_vdy, vdy, ydy0, ydy1, ydy2)
+                ACCUM_GRADS_V2(g_vdz, vdz, ydz0, ydz1, ydz2)
+
+                #undef ACCUM_GRADS_V2
+            }
+
+            // Warp-level reduction
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1) {
+                lgm0  += __shfl_down_sync(0xffffffff, lgm0,  off);
+                lgm1  += __shfl_down_sync(0xffffffff, lgm1,  off);
+                lgm2  += __shfl_down_sync(0xffffffff, lgm2,  off);
+                lga   += __shfl_down_sync(0xffffffff, lga,   off);
+                lgL00 += __shfl_down_sync(0xffffffff, lgL00, off);
+                lgL10 += __shfl_down_sync(0xffffffff, lgL10, off);
+                lgL11 += __shfl_down_sync(0xffffffff, lgL11, off);
+                lgL20 += __shfl_down_sync(0xffffffff, lgL20, off);
+                lgL21 += __shfl_down_sync(0xffffffff, lgL21, off);
+                lgL22 += __shfl_down_sync(0xffffffff, lgL22, off);
+            }
+
+            if (lane == 0) {
+                atomicAdd(&grad_means[k * 3 + 0], lgm0);
+                atomicAdd(&grad_means[k * 3 + 1], lgm1);
+                atomicAdd(&grad_means[k * 3 + 2], lgm2);
+                atomicAdd(&grad_amplitudes[k], lga);
+                float* gLk = &grad_L[k * 9];
+                atomicAdd(&gLk[0], lgL00);
+                atomicAdd(&gLk[3], lgL10);
+                atomicAdd(&gLk[4], lgL11);
+                atomicAdd(&gLk[6], lgL20);
+                atomicAdd(&gLk[7], lgL21);
+                atomicAdd(&gLk[8], lgL22);
+            }
+        }
+        __syncthreads();
+    }
 }
 
 
@@ -941,10 +968,12 @@ std::vector<torch::Tensor> gradient_supervision_backward_cuda(
     auto grad_amplitudes = torch::zeros_like(amplitudes);
     auto grad_L = torch::zeros({K, 9}, means.options());
 
+    // Per-point launch: N threads, each loops over K
     const int threads = 256;
-    const int blocks = (N * K + threads - 1) / threads;
+    const int blocks = (N + threads - 1) / threads;
+    const int smem = BACKWARD_TILE_K * (3 + 6 + 1) * sizeof(float);
 
-    gradient_supervision_backward_kernel<<<blocks, threads>>>(
+    gradient_supervision_backward_kernel<<<blocks, threads, smem>>>(
         grad_out.data_ptr<float>(),
         x_center.data_ptr<float>(),
         x_dx.data_ptr<float>(),

@@ -101,3 +101,13 @@ results/
 # Depth-Anything-V2 model weights (if large)
 Depth-Anything-V2/checkpoints/
 Depth-Anything-V2/*.pth
+
+# Large pre-rendered viewer HTML files
+neurogs_v7/rendering/viewer*.html
+
+# SWC morphology files
+*.swc
+
+# SSH keys (should never be committed)
+neurogs_v7/yes
+neurogs_v7/yes.pub

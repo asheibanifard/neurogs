@@ -34,6 +34,14 @@ setup(
         CUDAExtension(
             "gaussian_eval_cuda",
             ["gaussian_eval_cuda.cu"],
+            extra_compile_args={
+                'cxx': ['-O3'],
+                'nvcc': [
+                    '-O3',
+                    '--use_fast_math',
+                    '-lineinfo',
+                ]
+            }
         ),
     ],
     cmdclass={"build_ext": BuildExtension},

@@ -1,0 +1,109 @@
+# ============================================================
+#  Gaussian Mixture Field — Configuration
+# ============================================================
+# Tuned for microscopy neuron volumes (~100×647×813)
+# ============================================================
+
+seed: 42
+
+data:
+  tif_path: "10-2900-control-cell-05_cropped_corrected.tif"
+  swc_path: "10-2900-control-cell-05_cropped_corrected.swc"                # path to SWC file for Gaussian init (null = random init)
+
+model:
+  num_gaussians: 10000
+  # CRITICAL: init_scale must be large enough that Gaussians overlap
+  # and sampled points actually fall within Gaussian footprints.
+  # Rule of thumb: ~2 / K^{1/3}.  For K=10000, K^{1/3}≈21.5, so ~0.09
+  init_scale: 0.09
+  # Start amplitudes moderate — with 10K overlapping Gaussians at amp=1.0
+  # the sum would be enormous.  amp=0.05 lets ~20 overlapping Gaussians
+  # sum to ~1.0 which matches the [0,1] target range.
+  init_amplitude: 0.05
+  bounds: [[-1,1],[-1,1],[-1,1]]
+
+training:
+  device: auto
+  log_dir: logs
+  save_path: "checkpoints/gmf_refined.pt"
+  resume_from: None  # resume training from this checkpoint
+  mixed_precision: true
+
+  # ---- Strategy ----
+  mode: volume                  # volume + MIP supervision together
+  steps: 100000
+  learning_rate: 3.0e-3
+
+  # ---- Early stopping ----
+  early_stopping: true
+  early_stopping_patience: 20      # stop after N evals with no PSNR improvement
+  early_stopping_min_delta: 0.01   # require at least this dB improvement
+
+  log_every: 50
+  checkpoint_interval: 2000
+
+  # ---- Volume sampling ----
+  vol_points_per_step: 8192
+  vol_intensity_weighted: true
+
+  # ---- Gradient supervision (finite differences) ----
+  use_grad_loss: true
+  lambda_grad: 0.3  # Keep strong gradient supervision for quality
+  grad_delta_vox: 1
+
+  # ---- MIP settings ----
+  mip_pixels_per_step: 4096
+  mip_z_samples: 128
+  tau_start: 0.08
+  tau_end: 0.02
+
+  # ---- Regulariser weights ----
+  lambda_tube: 1.0e-4
+  lambda_cross: 1.0e-4
+  lambda_scale: 5.0e-4
+  scale_target: 0.05            # penalise scales > this (normalised coords)
+
+  # ---- Scale clamping (hard limits on log_scales) ----
+  # IMPORTANT: range must contain init_scale!
+  # init_scale=0.09 → log(0.09)≈-2.41, so log_scale_max must be > -2.41
+  clamp_scales: true
+  log_scale_min: -7.6           # exp(-7.6) ≈ 0.0005
+  log_scale_max: -1.2           # exp(-1.2) ≈ 0.30
+
+  # ---- Amplitude clamping ----
+  clamp_amplitudes: true
+  log_amp_min: -9.2             # exp(-9.2) ≈ 0.0001
+  log_amp_max: 0.0              # exp(0) = 1.0  (prevents amplitude explosion)
+
+  # ---- Gradient clipping ----
+  grad_clip_norm: 1.0           # max gradient norm (0 = disabled)
+
+  # ---- Weight schedule (volume + MIP balance) ----
+  weight_schedule: linear_ramp
+  w_vol_start: 1.0
+  w_mip_start: 0.1
+  w_vol_end: 1.0
+  w_mip_end: 0.8
+  weight_transition_fraction: 0.3
+
+  # ---- Densification & pruning ----
+  densify_enabled: true
+  densify_from_iter: 500
+  densify_until_iter: 30000      # stop densifying well before 36k (you had good PSNR at 30.5k)
+  densify_interval: 200          # halve the frequency
+  densify_grad_threshold: 8e-4 # lowered — 8e-4 was too high, densify never fired
+  max_gaussians: 15000           # tighter cap to prevent runaway
+  densify_min_opacity: 1.0e-3    # prune more aggressively
+  densify_max_scale: 0.8
+  densify_split_scale_threshold: 0.02  # lower so more Gaussians qualify for split over clone
+  densify_enforce_aabb: true
+  densify_max_clones_per_step: 200  # reduced cap; prefer splits over clones
+  densify_lr_factor: 0.2
+  densify_lr_warmup_steps: 25
+  densify_cooldown_evals: 5        # skip early-stopping checks for N evals after densify
+
+  # ---- AABB hard constraint ----
+  enforce_aabb_hard: false
+
+  # ---- Progressive mode (only used if mode: progressive) ----
+  progressive_split_frac: 0.3
