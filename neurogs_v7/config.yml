@@ -8,6 +8,7 @@ seed: 42
 
 data:
   tif_path: "10-2900-control-cell-05_cropped_corrected.tif"
+  swc_path: "10-2900-control-cell-05_cropped_corrected.swc"                # path to SWC file for Gaussian init (null = random init)
 
 model:
   num_gaussians: 10000
@@ -25,12 +26,18 @@ training:
   device: auto
   log_dir: logs
   save_path: "checkpoints/gmf_refined.pt"
+  resume_from: None  # resume training from this checkpoint
   mixed_precision: true
 
   # ---- Strategy ----
   mode: volume                  # volume + MIP supervision together
-  steps: 30000
+  steps: 100000
   learning_rate: 3.0e-3
+
+  # ---- Early stopping ----
+  early_stopping: true
+  early_stopping_patience: 20      # stop after N evals with no PSNR improvement
+  early_stopping_min_delta: 0.01   # require at least this dB improvement
 
   log_every: 50
   checkpoint_interval: 2000
@@ -63,6 +70,14 @@ training:
   log_scale_min: -7.6           # exp(-7.6) ≈ 0.0005
   log_scale_max: -1.2           # exp(-1.2) ≈ 0.30
 
+  # ---- Amplitude clamping ----
+  clamp_amplitudes: true
+  log_amp_min: -9.2             # exp(-9.2) ≈ 0.0001
+  log_amp_max: 0.0              # exp(0) = 1.0  (prevents amplitude explosion)
+
+  # ---- Gradient clipping ----
+  grad_clip_norm: 1.0           # max gradient norm (0 = disabled)
+
   # ---- Weight schedule (volume + MIP balance) ----
   weight_schedule: linear_ramp
   w_vol_start: 1.0
@@ -74,16 +89,18 @@ training:
   # ---- Densification & pruning ----
   densify_enabled: true
   densify_from_iter: 500
-  densify_until_iter: 20000
-  densify_interval: 100
-  max_gaussians: 50000
-  densify_grad_threshold: 1.5e-4
-  densify_min_opacity: 5.0e-4
+  densify_until_iter: 30000      # stop densifying well before 36k (you had good PSNR at 30.5k)
+  densify_interval: 200          # halve the frequency
+  densify_grad_threshold: 3.0e-4 # lowered — 8e-4 was too high, densify never fired
+  max_gaussians: 15000           # tighter cap to prevent runaway
+  densify_min_opacity: 1.0e-3    # prune more aggressively
   densify_max_scale: 0.8
-  densify_split_scale_threshold: 0.05
+  densify_split_scale_threshold: 0.02  # lower so more Gaussians qualify for split over clone
   densify_enforce_aabb: true
+  densify_max_clones_per_step: 200  # reduced cap; prefer splits over clones
   densify_lr_factor: 0.2
   densify_lr_warmup_steps: 25
+  densify_cooldown_evals: 5        # skip early-stopping checks for N evals after densify
 
   # ---- AABB hard constraint ----
   enforce_aabb_hard: false

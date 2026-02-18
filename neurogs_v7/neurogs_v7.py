@@ -418,6 +418,68 @@ def load_tif_data(file_path: str) -> np.ndarray:
     return ((vol - vmin) / (vmax - vmin)).astype(np.float32)
 
 
+def load_swc(file_path: str) -> np.ndarray:
+    """
+    Load an SWC morphology file and return (N, 4) array: [x, y, z, radius].
+    SWC format: id  type  x  y  z  radius  parent_id
+    Skips comment lines starting with '#'.
+    """
+    rows = []
+    with open(file_path, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            parts = line.split()
+            if len(parts) >= 7:
+                x, y, z, r = float(parts[2]), float(parts[3]), float(parts[4]), float(parts[5])
+                rows.append([x, y, z, r])
+    if not rows:
+        raise ValueError(f"No valid SWC nodes found in {file_path}")
+    return np.array(rows, dtype=np.float32)
+
+
+def swc_to_normalised_coords(
+    swc_data: np.ndarray,
+    vol_shape: tuple[int, int, int],
+    bounds: list | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Convert SWC coordinates (in voxel space) to normalised [-1, 1] coords.
+
+    Args:
+        swc_data: (N, 4) array [x, y, z, radius] in voxel coordinates.
+        vol_shape: (Z, Y, X) shape of the volume.
+        bounds: [[xlo,xhi],[ylo,yhi],[zlo,zhi]] normalised bounds (default [-1,1]).
+
+    Returns:
+        coords: (N, 3) normalised [x, y, z] coords.
+        radii:  (N,) normalised radii (average of xyz scale factors).
+    """
+    if bounds is None:
+        bounds = [[-1, 1], [-1, 1], [-1, 1]]
+    Z, Y, X = vol_shape
+    # SWC x → volume X axis, y → Y, z → Z
+    vox_max = np.array([X - 1, Y - 1, Z - 1], dtype=np.float32)
+    vox_max = np.maximum(vox_max, 1.0)  # avoid /0
+
+    xyz = swc_data[:, :3]  # (N, 3) in voxel coords
+    # Normalise each axis to [0, 1] then map to bounds
+    norm01 = xyz / vox_max  # (N, 3) in [0, 1]
+    coords = np.zeros_like(norm01)
+    scale_factors = []
+    for i in range(3):
+        lo, hi = bounds[i][0], bounds[i][1]
+        coords[:, i] = norm01[:, i] * (hi - lo) + lo
+        scale_factors.append((hi - lo) / vox_max[i])
+
+    # Normalise radius: average scale factor across axes
+    avg_scale = np.mean(scale_factors)
+    radii = swc_data[:, 3] * avg_scale
+
+    return coords.astype(np.float32), radii.astype(np.float32)
+
+
 # ===================================================================
 #  Loss helpers
 # ===================================================================
@@ -607,6 +669,8 @@ class GaussianMixtureField(nn.Module):
         init_amplitude: float = 0.1,
         bounds: list | None = None,
         aabb: list | None = None,
+        swc_coords: np.ndarray | None = None,
+        swc_radii: np.ndarray | None = None,
     ):
         super().__init__()
         self.num_gaussians = num_gaussians
@@ -620,7 +684,27 @@ class GaussianMixtureField(nn.Module):
             self.aabb = torch.tensor([[-1, 1], [-1, 1], [-1, 1]], dtype=torch.float32)
 
         # --- initialise means ---
-        if bounds is not None:
+        if swc_coords is not None:
+            # Initialise from SWC neuron morphology
+            n_swc = swc_coords.shape[0]
+            if n_swc >= num_gaussians:
+                # Subsample: uniformly pick num_gaussians points along the skeleton
+                idx = np.linspace(0, n_swc - 1, num_gaussians, dtype=int)
+                means = torch.from_numpy(swc_coords[idx]).float()
+            else:
+                # Fewer SWC nodes than Gaussians: use all nodes + fill rest
+                # by interpolating random pairs along skeleton edges
+                means_swc = torch.from_numpy(swc_coords).float()
+                n_extra = num_gaussians - n_swc
+                # Random pairs of consecutive nodes for interpolation
+                pair_idx = torch.randint(0, max(n_swc - 1, 1), (n_extra,))
+                t = torch.rand(n_extra, 1)
+                extra = means_swc[pair_idx] * (1 - t) + means_swc[pair_idx + 1] * t
+                # Add small jitter to avoid exact duplicates
+                extra += torch.randn_like(extra) * 0.001
+                means = torch.cat([means_swc, extra], dim=0)
+            print(f"SWC init: {n_swc} nodes → {num_gaussians} Gaussians")
+        elif bounds is not None:
             means = torch.zeros(num_gaussians, 3)
             for i in range(3):
                 lo, hi = bounds[i][0], bounds[i][1]
@@ -630,18 +714,33 @@ class GaussianMixtureField(nn.Module):
 
         self.means = nn.Parameter(means)
 
-        # Scale init: if user provides a very small init_scale, auto-compute
-        # a reasonable value so Gaussians have enough overlap for gradient flow.
-        # Rule of thumb: each Gaussian should cover ~ (volume_side / K^{1/3})
-        if init_scale < 1e-3:
-            # Auto: ~2× the mean nearest-neighbour distance for K uniform in [-1,1]³
-            side = 2.0  # [-1, 1]
-            init_scale = side / (num_gaussians ** (1.0 / 3.0)) * 1.5
-            print(f"⚠ init_scale too small, auto-set to {init_scale:.4f}")
-
-        self.log_scales = nn.Parameter(
-            torch.ones(num_gaussians, 3) * math.log(init_scale)
-        )
+        # Scale init: use SWC radii if provided, otherwise use init_scale
+        if swc_radii is not None:
+            # Per-Gaussian scale from SWC radius (isotropic initial scale)
+            if swc_coords.shape[0] >= num_gaussians:
+                idx = np.linspace(0, swc_coords.shape[0] - 1, num_gaussians, dtype=int)
+                radii_sel = swc_radii[idx]
+            else:
+                # Pad extra Gaussians with median radius
+                med_r = float(np.median(swc_radii))
+                radii_sel = np.concatenate([
+                    swc_radii,
+                    np.full(num_gaussians - swc_coords.shape[0], med_r, dtype=np.float32)
+                ])
+            radii_t = torch.from_numpy(radii_sel).float().clamp(min=1e-4)
+            self.log_scales = nn.Parameter(
+                torch.log(radii_t).unsqueeze(-1).expand(-1, 3).contiguous()
+            )
+            print(f"SWC scale init: radius range [{radii_t.min():.4f}, {radii_t.max():.4f}]")
+        else:
+            # Fallback: auto-compute if init_scale too small
+            if init_scale < 1e-3:
+                side = 2.0  # [-1, 1]
+                init_scale = side / (num_gaussians ** (1.0 / 3.0)) * 1.5
+                print(f"⚠ init_scale too small, auto-set to {init_scale:.4f}")
+            self.log_scales = nn.Parameter(
+                torch.ones(num_gaussians, 3) * math.log(init_scale)
+            )
 
         q = torch.zeros(num_gaussians, 4)
         q[:, 0] = 1.0  # identity rotation
@@ -687,6 +786,10 @@ class GaussianMixtureField(nn.Module):
     def clamp_log_scales_(self, lo: float, hi: float):
         with torch.no_grad():
             self.log_scales.data.clamp_(lo, hi)
+
+    def clamp_log_amplitudes_(self, lo: float, hi: float):
+        with torch.no_grad():
+            self.log_amplitudes.data.clamp_(lo, hi)
 
     # ---- forward (dispatches CUDA kernel or K-chunked PyTorch) -----------
     def forward(self, x: torch.Tensor, k_chunk: int = 1024) -> torch.Tensor:
@@ -772,6 +875,7 @@ class GaussianMixtureField(nn.Module):
         split_scale_threshold: float = 0.05,
         enforce_aabb: bool = True,
         max_gaussians: int = 0,
+        max_clones: int = 0,
     ) -> dict:
         with torch.no_grad():
             device = self.means.device
@@ -788,8 +892,16 @@ class GaussianMixtureField(nn.Module):
 
             new_m, new_ls, new_q, new_la = [], [], [], []
 
-            # Clone
+            # Clone (with optional cap)
             if clone_mask.any():
+                if max_clones > 0 and int(clone_mask.sum()) > max_clones:
+                    # Keep only the top-gradient clones
+                    clone_idx = clone_mask.nonzero(as_tuple=True)[0]
+                    clone_grads = grad_mag[clone_idx]
+                    _, topk = clone_grads.topk(max_clones, largest=True)
+                    clone_idx = clone_idx[topk]
+                    clone_mask = torch.zeros_like(clone_mask)
+                    clone_mask[clone_idx] = True
                 new_m.append(self.means[clone_mask])
                 new_ls.append(self.log_scales[clone_mask])
                 new_q.append(self.quaternions[clone_mask])
@@ -1126,6 +1238,18 @@ def train(
     tau_e = float(tc.get("tau_end", 0.02))
     mip_img = mip_teacher_z(vol)
 
+    # -- amplitude clamping ------------------------------------------------
+    clamp_amp = bool(tc.get("clamp_amplitudes", True))
+    la_min = float(tc.get("log_amp_min", math.log(1e-4)))   # exp(-9.2) ≈ 0.0001
+    la_max = float(tc.get("log_amp_max", math.log(1.0)))    # exp(0) = 1.0
+    if clamp_amp:
+        logger.info(f"Amplitude clamp=[{la_min:.3f}, {la_max:.3f}]  (amp=[{math.exp(la_min):.5f}, {math.exp(la_max):.4f}])")
+
+    # -- gradient clipping -------------------------------------------------
+    grad_clip = float(tc.get("grad_clip_norm", 1.0))  # 0 = disabled
+    if grad_clip > 0:
+        logger.info(f"Gradient clipping: max_norm={grad_clip}")
+
     # -- scale clamping ---------------------------------------------------
     do_clamp = bool(tc.get("clamp_scales", True))
     ls_min = float(tc.get("log_scale_min", math.log(5e-4)))   # ~0.0005
@@ -1155,6 +1279,8 @@ def train(
     dens_lr_fac = float(tc.get("densify_lr_factor", 0.2))
     dens_lr_warm = int(tc.get("densify_lr_warmup_steps", 25))
     dens_maxK = int(tc.get("max_gaussians", 20000))
+    dens_max_clones = int(tc.get("densify_max_clones_per_step", 0))  # 0 = unlimited
+    dens_cooldown = int(tc.get("densify_cooldown_evals", 5))  # skip ES checks after densify
     last_dens = -(10**9)
 
     # EMA accumulator for mean gradient magnitudes (more stable than single-step)
@@ -1186,6 +1312,16 @@ def train(
     timings: dict[str, list[float]] = {
         "sample": [], "vol_fwd": [], "mip_fwd": [], "backward": [], "optim": [],
     }
+
+    # -- early stopping --------------------------------------------------
+    es_on = bool(tc.get("early_stopping", False))
+    es_patience = int(tc.get("early_stopping_patience", 20))
+    es_min_delta = float(tc.get("early_stopping_min_delta", 0.01))  # dB
+    es_best_psnr = -float('inf')
+    es_no_improve = 0
+    es_best_path = None
+    if es_on:
+        logger.info(f"Early stopping: patience={es_patience} evals, min_delta={es_min_delta} dB")
 
     best_total = float('inf')
     pbar = tqdm(range(steps), desc="Training")
@@ -1305,10 +1441,15 @@ def train(
         t0 = time.time()
         if use_amp:
             scaler.scale(total_loss).backward()
+            if grad_clip > 0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(field.parameters(), grad_clip)
             scaler.step(optimizer)
             scaler.update()
         else:
             total_loss.backward()
+            if grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(field.parameters(), grad_clip)
             optimizer.step()
         scheduler.step()
         if device == "cuda":
@@ -1320,6 +1461,8 @@ def train(
             field.apply_aabb_clamp()
         if do_clamp:
             field.clamp_log_scales_(ls_min, ls_max)
+        if clamp_amp:
+            field.clamp_log_amplitudes_(la_min, la_max)
 
         losses["total"] = float(total_loss.detach())
 
@@ -1367,6 +1510,7 @@ def train(
                 split_scale_threshold=dens_split,
                 enforce_aabb=dens_aabb,
                 max_gaussians=dens_maxK,
+                max_clones=dens_max_clones,
             )
             logger.info(f"Densify@{step}: {stats}")
 
@@ -1433,6 +1577,29 @@ def train(
                 psnr = -10 * math.log10(max(mse, 1e-12))
                 logger.info(f"PSNR@{step+1}: {psnr:.2f} dB  (MSE={mse:.6f}, MAE={mae:.6f}, eval_pts={eval_n})")
 
+                # Early stopping check (skip during cooldown after densify)
+                steps_since_dens = step - last_dens
+                evals_since_dens = steps_since_dens // psnr_every
+                in_cooldown = dens_on and (evals_since_dens < dens_cooldown)
+                if es_on and in_cooldown:
+                    logger.info(f"Early stopping: cooldown ({evals_since_dens+1}/{dens_cooldown} evals after densify)")
+                elif es_on:
+                    if psnr > es_best_psnr + es_min_delta:
+                        es_best_psnr = psnr
+                        es_no_improve = 0
+                        # Save best checkpoint
+                        if save_path:
+                            es_best_path = save_path.replace(".pt", "_best.pt")
+                            os.makedirs(os.path.dirname(es_best_path) or ".", exist_ok=True)
+                            torch.save(field.state_dict(), es_best_path)
+                            logger.info(f"New best PSNR: {es_best_psnr:.2f} dB → {es_best_path}")
+                    else:
+                        es_no_improve += 1
+                        logger.info(f"Early stopping: no improvement {es_no_improve}/{es_patience} (best={es_best_psnr:.2f} dB)")
+                    if es_no_improve >= es_patience:
+                        logger.info(f"Early stopping triggered at step {step+1} (best PSNR: {es_best_psnr:.2f} dB)")
+                        break
+
         # ---------- checkpoint ----------
         save_path = tc.get("save_path")
         ckpt_every = int(tc.get("checkpoint_interval", 1000))
@@ -1444,6 +1611,11 @@ def train(
             logger.info(f"Checkpoint → {ckpt}")
 
     # -- timing report ----------------------------------------------------
+    # -- load best early-stopping checkpoint if available ---------------
+    if es_on and es_best_path and os.path.exists(es_best_path):
+        field.load_state_dict(torch.load(es_best_path, weights_only=True))
+        logger.info(f"Loaded best checkpoint (PSNR {es_best_psnr:.2f} dB) from {es_best_path}")
+
     logger.info("=" * 60)
     logger.info("TIMING  (mean ± std  ms)")
     logger.info("=" * 60)
@@ -1466,6 +1638,7 @@ def train(
 def main():
     parser = argparse.ArgumentParser(description="Train Gaussian Mixture Field")
     parser.add_argument("--config", default="config.yml", help="YAML config path")
+    parser.add_argument("--resume", default=None, help="Resume from checkpoint path (overrides config)")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -1486,13 +1659,48 @@ def main():
     vol = load_tif_data(cfg["data"]["tif_path"])
 
     mc = cfg["model"]
+
+    # Load SWC morphology for Gaussian initialization (if provided)
+    swc_coords, swc_radii = None, None
+    swc_path = cfg["data"].get("swc_path")
+    if swc_path and os.path.exists(swc_path):
+        swc_data = load_swc(swc_path)
+        swc_coords, swc_radii = swc_to_normalised_coords(
+            swc_data, vol.shape, bounds=mc.get("bounds")
+        )
+        print(f"Loaded SWC: {swc_data.shape[0]} nodes from {swc_path}")
+    elif swc_path:
+        print(f"WARNING: swc_path={swc_path} not found, using random init")
+
     field = GaussianMixtureField(
         num_gaussians=int(mc["num_gaussians"]),
         init_scale=float(mc.get("init_scale", 0.05)),
         init_amplitude=float(mc.get("init_amplitude", 0.1)),
         bounds=mc.get("bounds"),
         aabb=mc.get("aabb"),
+        swc_coords=swc_coords,
+        swc_radii=swc_radii,
     )
+
+    # Resume from checkpoint if specified
+    resume_path = args.resume or cfg["training"].get("resume_from")
+    if resume_path and os.path.exists(resume_path):
+        ckpt = torch.load(resume_path, map_location=device, weights_only=True)
+        # Handle checkpoint with different num_gaussians
+        K_ckpt = ckpt["means"].shape[0]
+        if K_ckpt != field.num_gaussians:
+            print(f"Checkpoint has K={K_ckpt} (config has {field.num_gaussians}), adjusting...")
+            field = GaussianMixtureField(
+                num_gaussians=K_ckpt,
+                init_scale=float(mc.get("init_scale", 0.05)),
+                init_amplitude=float(mc.get("init_amplitude", 0.1)),
+                bounds=mc.get("bounds"),
+                aabb=mc.get("aabb"),
+            )
+        field.load_state_dict(ckpt)
+        print(f"Resumed from {resume_path} (K={field.num_gaussians})")
+    elif resume_path:
+        print(f"WARNING: resume_from={resume_path} not found, training from scratch")
 
     log_dir = cfg["training"].get("log_dir", "logs")
     field = train(field, vol, cfg, device=device, log_dir=log_dir)
